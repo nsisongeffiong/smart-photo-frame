@@ -53,10 +53,10 @@ services:
     volumes:
       # Persistent album tree, mounted read-only: the service only ever reads
       # photos, so a compromised process cannot rewrite or delete them.
-      # Populate it out of band, e.g.
-      #   docker cp ./Family <container>:/photos/     (with the volume rw once)
-      #   or rsync into the volume's host path on the VPS.
-      - photos:/photos:ro
+      # A host path rather than a named volume, so the library lives where
+      # backups can reach it and rsync needs no sudo:
+      #   rsync -av ~/photos/family/ vps:/srv/photos/family/
+      - ${PHOTOS_HOST_DIR:-/srv/photos}:/photos:ro
 
     # Coolify terminates TLS and routes to this port; publishing it on the host
     # is only needed for local testing.
@@ -83,6 +83,3 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-
-volumes:
-  photos:
