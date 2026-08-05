@@ -1,0 +1,88 @@
+# smart-photo-frame — deployment composition.
+#
+# Coolify writes the environment into a .env file next to this compose file,
+# which is also the file Compose interpolates ${...} from.  Copy example.env to
+# .env for a manual deployment.
+
+services:
+  smart-photo-frame:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: smart-photo-frame:latest
+    restart: unless-stopped
+
+    environment:
+      PORT: "${PORT:-3000}"
+
+      # Home Assistant over Tailscale.  Use the raw 100.x address: MagicDNS
+      # does not resolve inside the container.
+      HA_BASE_URL: "${HA_BASE_URL}"
+      # Nabu Casa, used only while the primary is failing.
+      HA_BASE_URL_FALLBACK: "${HA_BASE_URL_FALLBACK}"
+      HA_TOKEN: "${HA_TOKEN}"
+
+      FRAME_KEY: "${FRAME_KEY}"
+      PHOTOS_DIR: "${PHOTOS_DIR:-/photos}"
+
+      HA_POLL_MS: "${HA_POLL_MS:-5000}"
+      SCAN_MS: "${SCAN_MS:-60000}"
+      HA_REPROBE_EVERY: "${HA_REPROBE_EVERY:-12}"
+      MAX_PHOTOS_PER_ALBUM: "${MAX_PHOTOS_PER_ALBUM:-500}"
+
+      AUTH_MAX_FAILS: "${AUTH_MAX_FAILS:-10}"
+      AUTH_WINDOW_MS: "${AUTH_WINDOW_MS:-60000}"
+
+      # REQUIRED here, and not merely a tuning knob.  server.js defaults
+      # TRUST_PROXY to false, which is correct for a service listening on the
+      # public internet directly.  This service listens behind Coolify's
+      # reverse proxy, so with the default every request arrives from the proxy
+      # address and req.ip is the proxy for every client.  The auth limiter
+      # then shares a single global bucket: measured behaviour is that twelve
+      # failed attempts from one address returned 429 to a completely unrelated
+      # address, locking real users out of the frame.  With "1" the same test
+      # returns 429 to the attacker, 401 to the bystander and 200 to a cookie
+      # holder requesting from the attacker's own address.
+      TRUST_PROXY: "1"
+
+      ENTITY_ALBUM: "${ENTITY_ALBUM:-input_select.photo_frame_album}"
+      ENTITY_DISPLAY: "${ENTITY_DISPLAY:-input_boolean.photo_frame_display}"
+      ENTITY_BRIGHTNESS: "${ENTITY_BRIGHTNESS:-input_number.photo_frame_brightness}"
+      ENTITY_INTERVAL: "${ENTITY_INTERVAL:-input_number.photo_frame_interval}"
+
+    volumes:
+      # Persistent album tree, mounted read-only: the service only ever reads
+      # photos, so a compromised process cannot rewrite or delete them.
+      # Populate it out of band, e.g.
+      #   docker cp ./Family <container>:/photos/     (with the volume rw once)
+      #   or rsync into the volume's host path on the VPS.
+      - photos:/photos:ro
+
+    # Coolify terminates TLS and routes to this port; publishing it on the host
+    # is only needed for local testing.
+    expose:
+      - "${PORT:-3000}"
+    # ports:
+    #   - "${PUBLISH_PORT:-3000}:${PORT:-3000}"
+
+    healthcheck:
+      test: ["CMD", "node", "-e", 'const http=require("http");const port=process.env.PORT||3000;const req=http.get({host:"127.0.0.1",port:port,path:"/healthz",timeout:4000},function(res){res.resume();process.exit(res.statusCode===200?0:1);});req.on("timeout",function(){req.destroy();process.exit(1);});req.on("error",function(){process.exit(1);});']
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+    # Pin the Tailscale address of Home Assistant if you would rather write a
+    # name than a 100.x literal in HA_BASE_URL.  MagicDNS is not available
+    # inside the container, so this is the only way a name will resolve.
+    # extra_hosts:
+    #   - "homeassistant:100.101.102.103"
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  photos:

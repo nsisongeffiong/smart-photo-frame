@@ -1,28 +1,10 @@
 # smart-photo-frame
 
-> Multi-model agentic development pipeline project.
+A photo frame for an iPad that is too old to run the Home Assistant frontend.
 
-## Run the pipeline
+An iPad on iOS 12.5.7 cannot render the Home Assistant UI at all — the modern
+frontend needs JavaScript features that Safari 12 does not have. This service
+sits in the middle: a small Node process on a public VPS polls Home Assistant
+itself, over Tailscale, and serves the iPad a plain static page containing no
+credentials and no modern syntax.
 
-```bash
-cd /home/nsisong/ai-workspace/projects/smart-photo-frame
-python scripts/run.py "Describe your task here"
-```
-
-## Pipeline stages
-
-| Stage | Model            | Role                          |
-|-------|------------------|-------------------------------|
-| 1     | Claude Opus 4.6  | Initial implementation        |
-| 2     | GPT-5.4          | Code quality & documentation  |
-| 3     | Gemini 2.5 Flash | Security & correctness audit  |
-| 4     | Claude Opus 4.6  | Final synthesis & corrections |
-
-## Tip: large tasks
-
-For tasks with multiple files (>3KB of instructions), save the task to a
-.sh script file and run it rather than pasting directly into the terminal.
-
-```bash
-bash ~/my-stage-task.sh
-```
