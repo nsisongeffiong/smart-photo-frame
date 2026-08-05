@@ -85,6 +85,9 @@ command -v node >/dev/null 2>&1 || fatal "node is required"
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/spf-verify.XXXXXX")" || fatal "cannot create temp dir"
 PIDS=()
+# Set by start_stub/start_server to the PID of the process they just launched.
+# Read it immediately after the call: a later call overwrites it.
+LAST_PID=""
 
 cleanup() {
   local pid
@@ -276,12 +279,15 @@ free_port() {
   node -e 'const s=require("net").createServer();s.listen(0,"127.0.0.1",()=>{const p=s.address().port;s.close(()=>console.log(p));});'
 }
 
-start_stub() { # <name> <port> <stateFile> -> echoes pid
+# The PID is published in LAST_PID rather than on stdout: a command
+# substitution would run this in a subshell, and the PIDS+=() registration —
+# the only thing that lets cleanup reap the stub and free its port — would be
+# discarded along with that subshell.
+start_stub() { # <name> <port> <stateFile> -> sets LAST_PID
   local name="$1" port="$2" state="$3"
   node "$TMP/ha-stub.js" "$port" "$state" >"$TMP/$name.log" 2>&1 &
-  local pid=$!
-  PIDS+=("$pid")
-  printf '%s' "$pid"
+  LAST_PID=$!
+  PIDS+=("$LAST_PID")
 }
 
 wait_http() { # <url> -> 0 when reachable
@@ -293,15 +299,23 @@ wait_http() { # <url> -> 0 when reachable
   return 1
 }
 
-start_server() { # <name> <port> [EXTRA=env ...] -> echoes pid
+start_server() { # <name> <port> [EXTRA=env ...] -> sets LAST_PID
   local name="$1" port="$2"
   shift 2
+  # Every tuning value below must sit inside the range server.js enforces in
+  # loadConfig(), or the process exits on a ConfigError before it ever listens:
+  # HA_POLL_MS >= 1000, SCAN_MS >= 5000, HA_REPROBE_EVERY 1..10000,
+  # MAX_PHOTOS_PER_ALBUM 1..200000, AUTH_WINDOW_MS >= 1000, AUTH_MAX_FAILS
+  # 1..1000. HA_POLL_MS is pinned to the floor so poll-driven assertions settle
+  # fast; assert_val's 12s budget absorbs the resulting 1s cadence and the 2s
+  # derived HA timeout. Nothing here waits on a second filesystem scan, so
+  # SCAN_MS only needs to be legal, not brisk.
   env PORT="$port" \
       HA_TOKEN="$HA_TOKEN" \
       FRAME_KEY="$FRAME_KEY" \
       PHOTOS_DIR="$PHOTOS" \
-      HA_POLL_MS=300 \
-      SCAN_MS=800 \
+      HA_POLL_MS=1000 \
+      SCAN_MS=5000 \
       HA_REPROBE_EVERY=3 \
       MAX_PHOTOS_PER_ALBUM="$MAX_PHOTOS" \
       AUTH_WINDOW_MS=600000 \
@@ -310,12 +324,20 @@ start_server() { # <name> <port> [EXTRA=env ...] -> echoes pid
       ENTITY_BRIGHTNESS="$ENTITY_BRIGHTNESS" \
       ENTITY_INTERVAL="$ENTITY_INTERVAL" \
       "$@" node server.js >"$TMP/$name.log" 2>&1 &
-  local pid=$!
-  PIDS+=("$pid")
-  printf '%s' "$pid"
+  LAST_PID=$!
+  PIDS+=("$LAST_PID")
 }
 
-stop_pid() { kill "$1" >/dev/null 2>&1; sleep 0.3; kill -9 "$1" >/dev/null 2>&1; return 0; }
+# Refuse anything that is not a plausible child PID. A mis-wired caller must
+# never be able to signal an unrelated process; 0 and 1 are singled out because
+# `kill 0` signals this harness's whole process group and 1 is init.
+stop_pid() { # <pid>
+  [[ ${1:-} =~ ^[0-9]+$ ]] && [ "$1" -gt 1 ] || return 0
+  kill "$1" >/dev/null 2>&1
+  sleep 0.3
+  kill -9 "$1" >/dev/null 2>&1
+  return 0
+}
 
 # ---------------------------------------------------------------------------
 # HTTP helpers
@@ -762,12 +784,12 @@ behaviour_checks() { # <state file>
 # Section 9 — failover and degradation
 # ---------------------------------------------------------------------------
 
-failover_checks() { # <base> <primary port> <primary state> <primary pid var name>
+failover_checks() { # <base> <primary port> <primary state> <primary pid> <fallback pid>
   section "Failover and degradation"
 
   local saved_base="$BASE" saved_jar="$JAR"
   BASE="$1"
-  local pport="$2" pstate="$3" ppid="$4" cport="$5"
+  local pport="$2" pstate="$3" ppid="$4" fpid="$5"
   JAR="$JAR_FO"
 
   rm -f "$JAR_FO"
@@ -782,7 +804,7 @@ failover_checks() { # <base> <primary port> <primary state> <primary pid var nam
   assert_val "the fallback album takes over" "capped" album
   assert_val "haOk stays true on the fallback" "true" haOk
 
-  stop_pid "$CPID"
+  stop_pid "$fpid"
   assert_val "haOk goes false when both endpoints die" "false" haOk
   http /api/state -b "$JAR_FO"
   check_eq "capped" "$(jval album)" "the last known album is retained while HA is down"
@@ -792,7 +814,7 @@ failover_checks() { # <base> <primary port> <primary state> <primary pid var nam
   assert_status 200 "/healthz stays reachable while HA is down" /healthz
   check_eq "false" "$(jval ha)" "/healthz reports ha false while HA is down"
 
-  PPID_NEW="$(start_stub ha-primary-restart "$pport" "$pstate")"
+  start_stub ha-primary-restart "$pport" "$pstate"
   wait_http "http://127.0.0.1:$pport/api/" || fail "the primary stub restarts"
   assert_val "haVia returns to primary once it recovers" "primary" haVia
   assert_val "the primary album is restored" "family" album
@@ -823,7 +845,7 @@ SRV_PORT="$(free_port)"
 SRV_RL_PORT="$(free_port)"
 SRV_FO_PORT="$(free_port)"
 
-start_stub ha-main "$HA_PORT" "$STATE_MAIN" >/dev/null
+start_stub ha-main "$HA_PORT" "$STATE_MAIN"
 wait_http "http://127.0.0.1:$HA_PORT/api/" || fatal "the main Home Assistant stub did not start"
 
 # Main instance: TRUST_PROXY at its shipped default. In that mode the auth
@@ -834,7 +856,7 @@ wait_http "http://127.0.0.1:$HA_PORT/api/" || fatal "the main Home Assistant stu
 BASE="http://127.0.0.1:$SRV_PORT"
 start_server srv-main "$SRV_PORT" \
   HA_BASE_URL="http://127.0.0.1:$HA_PORT" \
-  AUTH_MAX_FAILS=1000 >/dev/null
+  AUTH_MAX_FAILS=1000
 wait_http "$BASE/healthz" || fatal "server.js did not start; log: $(tail -n 5 "$TMP/srv-main.log")"
 JAR="$JAR_MAIN"
 
@@ -847,7 +869,7 @@ hostile_checks
 start_server srv-rl "$SRV_RL_PORT" \
   HA_BASE_URL="http://127.0.0.1:$HA_PORT" \
   TRUST_PROXY=1 \
-  AUTH_MAX_FAILS="$RL_MAX_FAILS" >/dev/null
+  AUTH_MAX_FAILS="$RL_MAX_FAILS"
 if wait_http "http://127.0.0.1:$SRV_RL_PORT/healthz"; then
   ratelimit_checks "http://127.0.0.1:$SRV_RL_PORT"
 else
@@ -856,18 +878,23 @@ fi
 
 behaviour_checks "$STATE_MAIN"
 
-PPID="$(start_stub ha-fo-primary "$HA_FO_PRIMARY_PORT" "$STATE_MAIN")"
-CPID="$(start_stub ha-fo-fallback "$HA_FO_FALLBACK_PORT" "$STATE_FALLBACK")"
+# Not PPID/CPID: PPID is a readonly bash builtin holding this shell's parent,
+# so the assignment fails while execution continues, and the stale value then
+# gets handed to stop_pid.
+start_stub ha-fo-primary "$HA_FO_PRIMARY_PORT" "$STATE_MAIN"
+HA_FO_PRIMARY_PID="$LAST_PID"
+start_stub ha-fo-fallback "$HA_FO_FALLBACK_PORT" "$STATE_FALLBACK"
+HA_FO_FALLBACK_PID="$LAST_PID"
 wait_http "http://127.0.0.1:$HA_FO_PRIMARY_PORT/api/" || fatal "the failover primary stub did not start"
 wait_http "http://127.0.0.1:$HA_FO_FALLBACK_PORT/api/" || fatal "the failover fallback stub did not start"
 
 start_server srv-fo "$SRV_FO_PORT" \
   HA_BASE_URL="http://127.0.0.1:$HA_FO_PRIMARY_PORT" \
   HA_BASE_URL_FALLBACK="http://127.0.0.1:$HA_FO_FALLBACK_PORT" \
-  AUTH_MAX_FAILS=1000 >/dev/null
+  AUTH_MAX_FAILS=1000
 if wait_http "http://127.0.0.1:$SRV_FO_PORT/healthz"; then
   failover_checks "http://127.0.0.1:$SRV_FO_PORT" \
-    "$HA_FO_PRIMARY_PORT" "$STATE_MAIN" "$PPID" "$HA_FO_FALLBACK_PORT"
+    "$HA_FO_PRIMARY_PORT" "$STATE_MAIN" "$HA_FO_PRIMARY_PID" "$HA_FO_FALLBACK_PID"
 else
   fail "the failover instance starts" "log: $(tail -n 3 "$TMP/srv-fo.log" | tr '\n' ' ')"
 fi

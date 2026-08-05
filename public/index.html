@@ -464,7 +464,7 @@ body {
     albumName: null,
     playlist: [],
     playIndex: -1,
-    playlistSig: '',
+    playlistSig: null,
     currentUrl: '',
 
     /* display */
@@ -795,8 +795,8 @@ body {
     app.state = normalizeState(raw);
     app.settingsSource = 'bridge';
     app.bootstrapped = true;
-    cacheCurrentAlbum();
     applySettings();
+    cacheCurrentAlbum();
   }
 
   function onPollError(reason) {
@@ -896,27 +896,42 @@ body {
   }
 
   function resolveAlbum(albums, wanted) {
-    if (typeof wanted === 'string' && wanted &&
-        hasOwn(albums, wanted) && isArray(albums[wanted]) && albums[wanted].length) {
+    /* Gate on the count of *valid* paths (post isSafeRelativePath filtering),
+       not the raw array length — otherwise an all-invalid album wins and the
+       frame sticks on "Waiting for photos…". */
+    if (typeof wanted === 'string' && wanted && albumPhotos(albums, wanted).length) {
       return wanted;
     }
     var fb = CONFIG.fallbackSchedule.album;
-    if (typeof fb === 'string' &&
-        hasOwn(albums, fb) && isArray(albums[fb]) && albums[fb].length) {
+    if (typeof fb === 'string' && albumPhotos(albums, fb).length) {
       return fb;
     }
     var keys = ownKeys(albums);
     var i;
     for (i = 0; i < keys.length; i++) {
-      if (isArray(albums[keys[i]]) && albums[keys[i]].length) { return keys[i]; }
+      if (albumPhotos(albums, keys[i]).length) { return keys[i]; }
     }
     return null;
   }
 
   function ensurePlaylist(name, photos) {
-    var sig = String(name) + '|' + photos.length + '|' +
-      (photos.length ? photos[0] : '') + '|' +
-      (photos.length ? photos[photos.length - 1] : '');
+    /* DJB2 over the name and every path: a same-count, same-endpoint album
+       edit still changes the hash, and we accumulate into a 32-bit integer
+       rather than allocating a ~200 KB string on every 15 s poll. */
+    var sig = 5381;
+    var s = String(name);
+    var i, j, p;
+    for (i = 0; i < s.length; i++) {
+      sig = ((sig << 5) + sig + s.charCodeAt(i)) | 0;
+    }
+    sig = ((sig << 5) + sig + 124) | 0;        /* '|' name/paths separator     */
+    for (i = 0; i < photos.length; i++) {
+      p = photos[i];
+      for (j = 0; j < p.length; j++) {
+        sig = ((sig << 5) + sig + p.charCodeAt(j)) | 0;
+      }
+      sig = ((sig << 5) + sig + 124) | 0;      /* '|' between paths             */
+    }
     if (sig === app.playlistSig) { return false; }
 
     app.playlistSig = sig;
@@ -1046,6 +1061,11 @@ body {
     whenSettled(handle, function (h) {
       if (token !== app.loadToken) {         /* superseded: drop the bitmap   */
         releaseImg(h.img);
+        return;
+      }
+      if (!app.displayOn) {                  /* switched off mid-load: don't    */
+        releaseImg(h.img);                   /* build a layer or reschedule     */
+        app.loading = false;
         return;
       }
       app.loading = false;
@@ -1234,11 +1254,17 @@ body {
 
   var tapCount = 0;
   var lastTapAt = 0;
+  var lastTouchAt = 0;
 
-  function onTap() {
+  function onTap(e) {
     var now = Date.now();
-    /* Swallow the synthetic click Safari fires ~300ms after touchend. */
-    if (now - lastTapAt < 80) { return; }
+    /* Drop the synthetic click Safari fires after a real touch, but only
+       then — a bare time guard also swallows genuinely fast human taps. */
+    if (e && e.type === 'click') {
+      if (now - lastTouchAt < 600) { return; }
+    } else {
+      lastTouchAt = now;                     /* touchend: remember the touch    */
+    }
 
     if (diagOpen()) {
       setDiag(false);

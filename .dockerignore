@@ -1,0 +1,33 @@
+# Build context: only server.js, public/, package.json and the lockfile
+# are needed. Everything below is dev or pipeline apparatus.
+
+.git
+.gitignore
+.gitattributes
+.dockerignore
+
+node_modules
+npm-debug.log*
+
+# Photos live in a mounted volume, never in the image
+photos
+
+# Pipeline apparatus
+reviews
+prompts
+scripts
+src
+test
+run*.sh
+
+# Test harness — not needed at runtime
+verify.sh
+
+# Secrets
+.env
+.env.*
+
+# Not needed in the image
+Dockerfile
+docker-compose.yaml
+*.md

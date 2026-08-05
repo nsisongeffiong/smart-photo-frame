@@ -30,3 +30,12 @@ Thumbs.db
 # Pipeline
 reviews/*.tmp
 .model_cache/
+
+# --- smart-photo-frame ---
+photos/
+src/generated.py
+run*.sh
+write-*.md
+fix-*.md
+.env.*
+!.env.example
