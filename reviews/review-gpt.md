@@ -1,209 +1,331 @@
 ## Documentation Gaps
 
-No material docstring gaps were found in the public API. The exported `loadConfig`, `AuthGate`, `HomeAssistantClient`, `PhotoLibrary`, `createPhotoHandler`, and `createApp` APIs have adequate JSDoc.
+No public functions or classes lack adequate docstrings.
+
+- `server.js` exports (`loadConfig`, `AuthGate`, `HomeAssistantClient`, `PhotoLibrary`, `createPhotoHandler`, and `createApp`) have adequate JSDoc.
+- Client functions in `public/index.html` are private to the page and sufficiently documented with inline comments.
+- `scripts/run.py` exposes no public API.
 
 ## Code Quality Issues
 
 ### Correctness
 
-- [public/index.html:779-788] `onState()` calls `cacheCurrentAlbum()` before `applySettings()`. On the first successful poll nothing is cached; after an album change, the previous album is cached until the next poll. Suggested fix: apply the new state first, then cache the resolved playlist.
+- [docker-compose.yaml:9] Compose specifies `dockerfile: Dockerfile`, but the repository contains only `Dockerfile.txt`. The supplied project cannot build without a manual rename. Suggested fix: commit the file as `Dockerfile`, or change the Compose setting to `Dockerfile.txt`.
 
-- [public/index.html:906-914] `resolveAlbum()` considers an album usable based on the raw array length, before unsafe paths are filtered. An album containing only invalid paths is selected instead of falling back to another valid album. Suggested fix: select albums based on `albumPhotos(albums, name).length`.
+- [Dockerfile.txt:22] The production build copies `package-lock.json` and runs `npm ci`, but no lockfile is present in the supplied repository. Docker builds will fail at `COPY`. Suggested fix: generate and commit `package-lock.json`; do not replace `npm ci` with an unreproducible install.
 
-- [public/index.html:917-932] The playlist signature only includes the album name, count, first path, and last path. Changes to middle entries are ignored, leaving the slideshow permanently stale when the count and endpoints remain unchanged. Suggested fix: compute the signature from every validated path.
+- [public/index.html:917-985] Changing playlists does not immediately invalidate an image already loading. `ensurePlaylist()` schedules a replacement after `wakeDelayMs`, but the old load retains the current `loadToken`; if it settles before the replacement `advance()` runs, a photo from the previous album is displayed. Suggested fix: increment `app.loadToken` immediately when the playlist changes, or retain and cancel the active load.
 
-- [public/index.html:971-985,1026-1056] A playlist change schedules another `advance()` even when an old image load is still running. Both loads can complete, briefly display a photo from the previous album, and violate the stated low-memory loading constraint. There is no retained handle for cancelling or invalidating the active load when settings change. Suggested fix: track the active load, invalidate it when the playlist/display state changes, and only start a replacement after the stale callback has released its image.
+- [public/index.html:704-778] `poll()` allows concurrent XHRs, particularly when `pageshow` or `visibilitychange` overlaps the interval poll. A slower, older response can arrive last and overwrite newer state. Suggested fix: serialize polls with an in-flight flag or associate each request with a monotonically increasing sequence number and ignore stale responses.
 
-- [public/index.html:1166-1193] The synthetic-click suppression does not match its comment. Safari’s compatibility click typically arrives hundreds of milliseconds after `touchend`, so the 80 ms check can count one physical tap twice and open diagnostics after fewer than three taps. Suggested fix: pass the event to the handler and suppress `click` events for a short period after a touch event.
+- [server.js:580-625] `HomeAssistantClient.poll()` treats any successfully fetched state string as usable before semantic validation. Four responses containing `unknown`, `unavailable`, or invalid numeric values set `haOk=true` and advance `haLastOk`, even though `#applyValues()` updates nothing. Suggested fix: have state application report how many values were accepted and derive `haOk`/`haLastOk` from that result.
 
-- [server.js:760-784] Album selection at the 512-album cap depends on filesystem `readdir()` order. Large libraries can expose a different set of albums after rescans. Suggested fix: filter and sort candidate album entries before applying the cap.
+- [server.js:1054-1067] `main()` neither waits for the server to listen nor handles the server’s asynchronous `error` event. `EADDRINUSE` and `EACCES` bypass the structured fatal-error path. The JSDoc claiming that `main()` resolves once listening is also inaccurate. Suggested fix: await a promise that resolves on `listening` and rejects on `error`.
 
-- [server.js:805-831] `HARD_ALBUM_SCAN_LIMIT` is applied before sorting. A directory exceeding 200,000 valid images still gets a nondeterministic subset, despite the surrounding determinism guarantees. Suggested fix: use a bounded ordered selection structure or explicitly reject/skip over-limit albums rather than selecting based on enumeration order.
-
-- [server.js:1054-1067] `main()` does not handle the HTTP server’s asynchronous `error` event. An occupied port or permission failure produces an uncaught emitter error rather than the structured fatal log path. Suggested fix: attach an `error` listener and await either `listening` or `error`.
-
-- [scripts/run.py:38] Starting a missing or non-executable `VENV_PYTHON` raises an uncaught `OSError`, producing a traceback instead of the runner’s concise configuration error. Suggested fix: validate the executable or catch `OSError` around `subprocess.run()`.
+- [scripts/run.py:38] A missing or non-executable shared Python interpreter raises an uncaught `OSError` and prints a traceback. Suggested fix: catch `OSError`, emit the same concise configuration-style error used for a missing orchestrator, and exit nonzero.
 
 ### Maintainability
 
-- [src/index.js:1-2] This generated placeholder is an unused competing entry point; `package.json` correctly points to `server.js`. Suggested fix: remove `src/index.js`.
+- [public/index.html:388-437] `app.diagHideTimer` and `app.tickTimer` are assigned later but omitted from the timer fields in the state declaration. This does not break JavaScript, but makes timer ownership incomplete and easier to overlook during cleanup. Suggested fix: declare both fields as `null` with the other timers.
 
 ## Test Coverage
 
-### Browser client
+### Deployment
 
-`public/index.html` currently has no automated coverage. Add tests using a Safari-12-compatible DOM/XHR harness for:
+Add a CI build test that:
 
-- First successful bridge response caches the newly resolved album immediately.
-- Switching albums during an in-flight image load never displays the old album’s image.
-- Turning the display off during a load releases the completed stale image and does not schedule another photo.
-- An album containing only unsafe paths falls back to an album containing valid paths.
-- A middle-only playlist change is detected when album name, length, first item, and last item remain unchanged.
-- Exactly three physical touch taps open diagnostics; compatibility click events do not increment the count.
-- Schedule selection before the first entry wraps to the prior day’s last entry.
-- Malformed cached JSON, invalid paths, unavailable local storage, and storage quota failures degrade safely.
-- Failed preloads, image timeouts, consecutive-failure backoff, and playlist wrap reshuffling.
-- Layer cleanup under rapid successive transitions never leaves more than two layers.
+- Runs `docker compose config`.
+- Builds the production image from a clean checkout.
+- Verifies that the configured Dockerfile and lockfile exist.
+- Starts the image with minimal configuration and checks `/healthz`.
 
-### Server
+These tests would currently catch both packaging failures.
 
-Existing smoke tests do not exercise most network-facing behavior. Add cases for:
+### Browser Client
 
-- All HA entities succeed and update the snapshot.
-- Four `401` responses leave `haOk` false and do not advance `haLastOk`.
-- One entity succeeds while three time out; last-known-good values and degradation details are correct.
-- Primary failure, fallback activation, and scheduled primary reprobe.
-- Oversized chunked bodies and oversized declared bodies are rejected.
-- Redirect responses do not forward the bearer token.
-- Strict numeric parsing for whitespace, `NaN`, infinity, and values such as `50abc`.
-- `/healthz` returns `200` and `503` in the appropriate library states.
-- Authentication, security headers, `HEAD`, `405`, static `404`, and `/api/state` cache headers through a real HTTP server.
-- Photo traversal, encoded separators, extra segments, disappearing files, and symlinks escaping the root.
-- More than 512 albums and more than 200,000 files produce deterministic behavior.
-- An occupied port is reported through the intended fatal-error path.
-- Expired auth buckets, valid-cookie bypass, duplicate cookies, and bucket-cap eviction.
-- Repeated shutdown signals remain idempotent.
+There is no automated client coverage. Add focused tests for:
 
-### Pipeline runner
+- An album change while the previous album’s image is loading; the old image must never reach `showLayer()`.
+- Two overlapping polls where the older request resolves last; only the newest response should be applied.
+- Display-off during image loading; the image is released and no subsequent photo is scheduled.
+- Invalid-only requested album falling back to an album with valid paths.
+- A middle-only playlist change being detected.
+- Exactly three touch taps opening diagnostics while synthetic clicks are ignored.
+- Schedule selection before the first daily entry wrapping to the previous day’s final entry.
+- Malformed cache JSON, unavailable storage, quota failure, and unsafe cached paths.
+- Image timeout, preload failure, consecutive-failure backoff, and playlist wrap.
+- Rapid transitions never leaving more than two photo layers in the DOM.
 
-Add Python subprocess tests for:
+### Home Assistant Client
 
-- Missing and non-executable virtual-environment interpreter.
+Current tests only verify initial state. Add cases for:
+
+- Four valid entities updating the snapshot and `haLastOk`.
+- Four HTTP `401` responses leaving `haOk=false`.
+- Four successful responses containing `unknown`/`unavailable`; `haOk` and `haLastOk` must not indicate a usable poll.
+- Invalid brightness and interval strings preserving last-known-good values.
+- One valid entity plus three invalid or timed-out entities, including degradation details.
+- Primary transport failure activating fallback.
+- Periodic primary reprobe switching back after recovery.
+- Oversized declared and chunked response bodies.
+- Redirect rejection without forwarding the bearer token.
+
+### HTTP and Authentication
+
+Add real-server tests for:
+
+- `/healthz` returning `200` after a successful scan and `503` after scan failure.
+- `/api/state`, static files, and photos requiring authentication.
+- Valid-cookie bypass of throttling.
+- Expired bucket cleanup and bucket-cap eviction.
+- Duplicate and malformed cookies.
+- `HEAD`, unsupported methods, security headers, cache headers, and generic error bodies.
+- Photo traversal, encoded separators, extra path segments, missing files, and symlinks escaping the root.
+- Occupied-port startup reaching the structured fatal path.
+
+### Pipeline Runner
+
+Add subprocess tests for:
+
+- Missing and non-executable `VENV_PYTHON`.
 - Missing orchestrator.
-- Brand directory absent, populated, and empty.
-- Failed `git submodule update` continues with a warning.
-- Orchestrator exit status is propagated unchanged.
+- Empty, populated, and absent `brand` directories.
+- Failed submodule initialization continuing with a warning.
+- Exact propagation of the orchestrator’s exit code.
 
 ## Suggested Improvements
 
-### 1. Resolve and cache the new playlist in the correct order
+### 1. Make the checked-in Docker filename match Compose
+
+Before:
+
+```yaml
+services:
+  smart-photo-frame:
+    build:
+      context: .
+      dockerfile: Dockerfile
+```
+
+Repository file:
+
+```text
+Dockerfile.txt
+```
+
+After:
+
+```text
+Dockerfile
+```
+
+```yaml
+services:
+  smart-photo-frame:
+    build:
+      context: .
+      dockerfile: Dockerfile
+```
+
+Also generate and commit the required lockfile:
+
+```sh
+npm install --package-lock-only
+git add Dockerfile package-lock.json
+```
+
+### 2. Invalidate an active image load when the playlist changes
 
 Before:
 
 ```js
-function onState(raw) {
-  app.bridgeOk = true;
-  app.bridgeFailures = 0;
-  app.lastPollError = '';
-  app.lastStateAt = Date.now();
-  app.state = normalizeState(raw);
-  app.settingsSource = 'bridge';
-  app.bootstrapped = true;
-  cacheCurrentAlbum();
-  applySettings();
+if (sig === app.playlistSig) { return false; }
+
+app.playlistSig = sig;
+app.albumName = name || null;
+app.playlist = photos.slice(0);
+shuffle(app.playlist);
+app.playIndex = -1;
+app.failStreak = 0;
+releasePreload();
+return true;
+```
+
+After:
+
+```js
+if (sig === app.playlistSig) { return false; }
+
+/* Prevent an old album's in-flight image from reaching onPhotoReady(). */
+app.loadToken++;
+
+app.playlistSig = sig;
+app.albumName = name || null;
+app.playlist = photos.slice(0);
+shuffle(app.playlist);
+app.playIndex = -1;
+app.failStreak = 0;
+releasePreload();
+return true;
+```
+
+For clearer ownership, retain the active handle as well:
+
+```js
+/* Runtime state */
+activeLoad: null,
+```
+
+```js
+app.activeLoad = handle;
+app.loading = true;
+
+whenSettled(handle, function (h) {
+  if (app.activeLoad === h) { app.activeLoad = null; }
+
+  if (token !== app.loadToken) {
+    releaseImg(h.img);
+    return;
+  }
+
+  app.loading = false;
+  /* ... */
+});
+```
+
+### 3. Prevent stale bridge responses from winning
+
+Before:
+
+```js
+function poll() {
+  var settled = false;
+  var xhr = new XMLHttpRequest();
+  /* ... */
+  xhr.send(null);
+}
+```
+
+After, using request sequencing:
+
+```js
+var pollSequence = 0;
+var appliedPollSequence = 0;
+
+function poll() {
+  var sequence = ++pollSequence;
+  var settled = false;
+  var xhr = new XMLHttpRequest();
+
+  function acceptState(data) {
+    if (sequence < appliedPollSequence) { return; }
+    appliedPollSequence = sequence;
+    onState(data);
+  }
+
+  /* ... */
+
+  xhr.onreadystatechange = function () {
+    if (xhr.readyState !== 4 || settled) { return; }
+    settled = true;
+
+    if (xhr.status >= 200 && xhr.status < 300) {
+      var data = null;
+      try {
+        data = JSON.parse(xhr.responseText);
+      } catch (err) {
+        data = null;
+      }
+
+      if (data && typeof data === 'object' && !isArray(data)) {
+        acceptState(data);
+      } else {
+        onPollError('malformed JSON from bridge');
+      }
+    } else {
+      onPollError('HTTP ' + (xhr.status || 0));
+    }
+  };
+
+  xhr.send(null);
+}
+```
+
+Alternatively, an in-flight guard is simpler if immediate visibility-triggered refreshes are not required.
+
+### 4. Base HA health on accepted values
+
+Before:
+
+```js
+const usable = Object.keys(outcome.values).length > 0;
+this.#haOk = usable;
+
+if (usable) {
+  this.#lastOkAt = Date.now();
+  this.#applyValues(outcome.values);
 }
 ```
 
 After:
 
 ```js
-function onState(raw) {
-  app.bridgeOk = true;
-  app.bridgeFailures = 0;
-  app.lastPollError = '';
-  app.lastStateAt = Date.now();
-  app.state = normalizeState(raw);
-  app.settingsSource = 'bridge';
-  app.bootstrapped = true;
+const accepted = this.#applyValues(outcome.values);
+const usable = accepted > 0;
+this.#haOk = usable;
 
-  applySettings();
-  cacheCurrentAlbum();
+if (usable) {
+  this.#lastOkAt = Date.now();
 }
 ```
 
-### 2. Validate album contents while resolving the album
-
-Before:
+Change `#applyValues()` to return the accepted count:
 
 ```js
-function resolveAlbum(albums, wanted) {
-  if (typeof wanted === 'string' && wanted &&
-      hasOwn(albums, wanted) && isArray(albums[wanted]) && albums[wanted].length) {
-    return wanted;
+#applyValues(values) {
+  let accepted = 0;
+
+  const album = typeof values.album === 'string' ? values.album.trim() : null;
+  if (album !== null &&
+      !UNAVAILABLE_STATES.has(album.toLowerCase()) &&
+      isValidAlbumName(album)) {
+    this.#values.album = album;
+    accepted += 1;
   }
 
-  // Other candidates use the same raw-array check.
-}
-```
-
-After:
-
-```js
-function hasUsablePhotos(albums, name) {
-  return typeof name === 'string' &&
-    hasOwn(albums, name) &&
-    albumPhotos(albums, name).length > 0;
-}
-
-function resolveAlbum(albums, wanted) {
-  if (hasUsablePhotos(albums, wanted)) {
-    return wanted;
-  }
-
-  var fallback = CONFIG.fallbackSchedule.album;
-  if (hasUsablePhotos(albums, fallback)) {
-    return fallback;
-  }
-
-  var keys = ownKeys(albums);
-  var i;
-  for (i = 0; i < keys.length; i++) {
-    if (hasUsablePhotos(albums, keys[i])) {
-      return keys[i];
+  if (typeof values.display === 'string') {
+    const display = values.display.trim().toLowerCase();
+    if (display === 'on' || display === 'off') {
+      this.#values.display = display === 'on';
+      accepted += 1;
     }
   }
-  return null;
-}
-```
 
-### 3. Detect all playlist changes
-
-Before:
-
-```js
-var sig = String(name) + '|' + photos.length + '|' +
-  (photos.length ? photos[0] : '') + '|' +
-  (photos.length ? photos[photos.length - 1] : '');
-```
-
-After:
-
-```js
-function playlistSignature(name, photos) {
-  var parts = [String(name), String(photos.length)];
-  var i;
-
-  for (i = 0; i < photos.length; i++) {
-    parts.push(String(photos[i].length));
-    parts.push(photos[i]);
+  const brightness = parseFiniteState(values.brightness);
+  if (brightness !== null) {
+    this.#values.brightness = clamp(Math.round(brightness), 10, 100);
+    accepted += 1;
   }
-  return parts.join('|');
-}
 
-function ensurePlaylist(name, photos) {
-  var sig = playlistSignature(name, photos);
-  if (sig === app.playlistSig) { return false; }
+  const interval = parseFiniteState(values.interval);
+  if (interval !== null) {
+    this.#values.interval = clamp(Math.round(interval), 1, 3600);
+    accepted += 1;
+  }
 
-  app.playlistSig = sig;
-  app.albumName = name || null;
-  app.playlist = photos.slice(0);
-  shuffle(app.playlist);
-  app.playIndex = -1;
-  app.failStreak = 0;
-  releasePreload();
-  return true;
+  return accepted;
 }
 ```
 
-Length-prefixing avoids ambiguous signatures such as `["a|b", "c"]` versus `["a", "b|c"]`.
-
-### 4. Report server startup failures predictably
+### 5. Await server startup errors
 
 Before:
 
 ```js
 const server = app.listen(config.port, () => {
-  log('info', 'listening', { port: config.port });
+  log('info', 'listening', {
+    port: config.port
+  });
 });
 ```
 
@@ -220,13 +342,16 @@ const server = await new Promise((resolve, reject) => {
 log('info', 'listening', {
   port: config.port,
   photosDir: photosRoot,
+  haRoutes: config.haRoutes.map((route) => route.name),
+  haPollMs: config.haPollMs,
+  scanMs: config.scanMs,
   trustProxy: String(config.trustProxy)
 });
 ```
 
-This allows the existing `main().catch(...)` path to log `EADDRINUSE` and exit cleanly.
+This makes `main()` satisfy its JSDoc and routes bind failures through the existing `main().catch(...)` handler.
 
-### 5. Handle pipeline launch failures without a traceback
+### 6. Handle pipeline launch failures cleanly
 
 Before:
 
@@ -234,7 +359,7 @@ Before:
 result = subprocess.run(
     [str(VENV_PYTHON), str(ORCHESTRATOR)] + sys.argv[1:],
     env=env,
-    cwd=str(PROJECT_ROOT),
+    cwd=str(PROJECT_ROOT)
 )
 sys.exit(result.returncode)
 ```
