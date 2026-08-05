@@ -677,6 +677,20 @@ ratelimit_checks() { # <base url>
   http_ip "$bad_ip" /api/state -b "$JAR_RL"
   check_eq "200" "$HTTP_STATUS" "a cookie holder is served even from the throttled address"
 
+  # A wrong key from a throttled address is still refused outright.
+  http_ip "$bad_ip" "/?k=definitely-not-the-frame-key-000000000000"
+  check_eq "429" "$HTTP_STATUS" "a wrong ?k= from the throttled address stays 429"
+
+  # ...but the correct key is honoured despite the throttle, and clears it. A
+  # client whose cookie does not stick records a failure on every cookieless
+  # request it makes, so it fills its own bucket; checking the throttle before
+  # the key locked the real frame out with the key in its hand. Keep these two
+  # last: a correct key resets the bucket the assertions above depend on.
+  http_ip "$bad_ip" "/?k=$FRAME_KEY"
+  check_eq "303" "$HTTP_STATUS" "the correct ?k= is honoured from a throttled address"
+  http_ip "$bad_ip" /api/state
+  check_eq "401" "$HTTP_STATUS" "a successful key clears that address's failures"
+
   BASE="$saved"
 }
 

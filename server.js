@@ -529,7 +529,19 @@ export class AuthGate {
     const ip = this.#clientIp(req);
 
     if (provided !== null) {
-      if (this.#isThrottled(ip)) return this.#tooManyRequests(res, ip);
+      // The correct key is honoured even from a throttled address, and clears
+      // that address's failures. The throttle exists to slow key *guessing*, and
+      // a correct key is not a guess; the compare is constant-time and touches
+      // nothing but memory, so testing it first costs nothing and leaks nothing
+      // beyond what the untrottled path already did.
+      //
+      // Checking the throttle first locked the real frame out. Every request the
+      // frame makes without a cookie — api/state on every poll, every photo —
+      // records a failure, so a client whose cookie does not stick (an iOS
+      // home-screen web app: separate cookie store, and ALLOW_QUERY_KEY exists
+      // precisely because it cannot hold Safari's) fills its own bucket within
+      // one page load and was then refused 429 for the very key that proves it
+      // is the frame.
       if (safeEqual(provided, this.#frameKey)) {
         this.#buckets.delete(ip);
         this.#issueCookie(res);
@@ -540,6 +552,9 @@ export class AuthGate {
         if (this.#allowQueryKey) return next();
         return this.#redirectBare(req, res);
       }
+      // A wrong key is a guess: throttled addresses get 429, everyone else 401,
+      // and the attempt is counted either way.
+      if (this.#isThrottled(ip)) return this.#tooManyRequests(res, ip);
       this.#recordFailure(ip);
       if (!open) return this.#unauthorized(res);
       return next();

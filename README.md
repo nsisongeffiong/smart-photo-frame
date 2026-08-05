@@ -474,6 +474,7 @@ Note that `HA_BASE_URL_FALLBACK` is ignored if it is identical to
 | --- | --- |
 | The frame authenticates, then 401s on the next request | No HTTPS. The `Secure`/`__Host-` cookie was discarded. |
 | One client's failed logins 429 everyone | `TRUST_PROXY` not set behind the proxy. |
+| The Home Screen icon shows `Too Many Requests` | The frame's cookieless requests (`api/state` on every poll, every photo) each count as a failure and fill its own bucket. A correct `?k=` is never throttled, so the icon itself works — but if the page then shows no photos, the web app is not holding the cookie at all. |
 | An album in the HA dropdown shows nothing | The dropdown option does not exactly match the directory name, or the directory name failed the allowlist (grep the log for `skipping album with unsupported name`). |
 | Photos load but appear blank or skipped | `.webp` or `.heic` files — Safari 12 cannot decode them. |
 | The frame reloads in a loop or goes white | Photos not downscaled; 1 GB of RAM exhausted. |
@@ -511,7 +512,13 @@ is the intended upgrade path; nothing in this service fights it.
 
 `AUTH_MAX_FAILS` failures per `AUTH_WINDOW_MS` per client address, tracked in
 memory in a map capped at 10 000 entries and swept periodically. Successful
-cookie holders are never counted and never throttled.
+cookie holders are never counted and never throttled, and **a request carrying
+the correct `?k=` is honoured even from a throttled address** — it also clears
+that address's failures. Only wrong keys and missing credentials are counted, so
+the limiter can never lock out a client that holds the key. That ordering
+matters: a client whose cookie does not stick records a failure on every
+cookieless request it makes, which is enough to fill its own bucket in one page
+load.
 
 It makes online guessing of a 48-character random key hopeless in practice. It
 does not stop a distributed attempt from many addresses, it resets when the
