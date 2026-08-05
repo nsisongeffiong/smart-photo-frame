@@ -1,3 +1,12 @@
+# Final Synthesis Review
+
+Two reviews were triaged against the source. No brand guide was supplied with this task, so no colour/font/spacing/copy decisions were in play — nothing in either review touched brand surfaces, and all existing copy strings, the CSP posture and the deliberate Safari‑12 design notes are preserved verbatim.
+
+Summary: **11 accepted** (9 in `server.js`, 1 in `package.json`, 1 lead-engineer addition), **1 accepted with modification**, **1 rejected in part**, **6 escalated**.
+
+---
+
+```javascript server.js
 #!/usr/bin/env node
 /**
  * smart-photo-frame — server
@@ -1459,3 +1468,394 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     process.exit(1);
   });
 }
+```
+
+```json package.json
+{
+  "name": "smart-photo-frame",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Server that polls Home Assistant and serves a same-origin photo frame page to an iPad on iOS 12.5.7.",
+  "type": "module",
+  "main": "server.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "express": "4.21.2"
+  }
+}
+```
+
+```javascript test/smoke.test.js
+/**
+ * smart-photo-frame — smoke tests
+ *
+ * Deliberately dependency-free (node:test only, no devDependencies, no lockfile
+ * churn) so `npm test` is runnable the moment the repository is cloned. This
+ * covers the boot-time trust boundary (config validation), the auth gate's
+ * redirect and throttling behaviour, and the photo library's containment and
+ * determinism rules. The fuller matrix listed in final-review.md is still owed.
+ */
+
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+
+import { loadConfig, AuthGate, HomeAssistantClient, PhotoLibrary } from '../server.js';
+
+const FRAME_KEY = 'a1b2c3d4e5f6g7h8i9';
+
+/**
+ * @param {Record<string, string>} [extra] Overrides.
+ * @returns {NodeJS.ProcessEnv} A minimal valid environment.
+ */
+function baseEnv(extra = {}) {
+  return /** @type {NodeJS.ProcessEnv} */ ({
+    HA_BASE_URL: 'http://ha.internal:8123/',
+    HA_TOKEN: 'token-'.padEnd(48, 'x'),
+    FRAME_KEY,
+    ...extra
+  });
+}
+
+/** @returns {any} A response double recording what a handler did to it. */
+function fakeRes() {
+  return {
+    headers: Object.create(null),
+    statusCode: 200,
+    body: null,
+    location: null,
+    setHeader(name, value) {
+      this.headers[String(name).toLowerCase()] = value;
+    },
+    status(code) {
+      this.statusCode = code;
+      return this;
+    },
+    type() {
+      return this;
+    },
+    send(body) {
+      this.body = body;
+      return this;
+    },
+    redirect(code, target) {
+      this.statusCode = code;
+      this.location = target;
+      return this;
+    }
+  };
+}
+
+/**
+ * @param {string} name Prefix.
+ * @returns {Promise<string>} A fresh temporary directory.
+ */
+function tempRoot(name) {
+  return fs.mkdtemp(path.join(os.tmpdir(), `spf-${name}-`));
+}
+
+/* --------------------------------- config -------------------------------- */
+
+test('loadConfig accepts a minimal valid environment', () => {
+  const config = loadConfig(baseEnv());
+  assert.equal(config.port, 3000);
+  assert.deepEqual(config.haRoutes, [{ name: 'primary', base: 'http://ha.internal:8123' }]);
+  assert.equal(config.haPollMs, 10_000);
+  assert.equal(config.haTimeoutMs, 9_000);
+  assert.equal(config.entities.album, 'input_select.photo_frame_album');
+  assert.match(config.sessionToken, /^[0-9a-f]{64}$/);
+  assert.notEqual(config.sessionToken, FRAME_KEY);
+});
+
+test('TRUST_PROXY defaults to false and parses every supported form', () => {
+  assert.equal(loadConfig(baseEnv()).trustProxy, false);
+  assert.equal(loadConfig(baseEnv({ TRUST_PROXY: '1' })).trustProxy, 1);
+  assert.equal(loadConfig(baseEnv({ TRUST_PROXY: 'true' })).trustProxy, true);
+  assert.equal(loadConfig(baseEnv({ TRUST_PROXY: 'false' })).trustProxy, false);
+  assert.equal(loadConfig(baseEnv({ TRUST_PROXY: 'loopback' })).trustProxy, 'loopback');
+});
+
+test('loadConfig rejects missing, weak and unsafe values', () => {
+  assert.throws(() => loadConfig(/** @type {NodeJS.ProcessEnv} */ ({})), /missing required environment variable/);
+  assert.throws(() => loadConfig(baseEnv({ FRAME_KEY: 'short' })), /at least 16 characters/);
+  assert.throws(() => loadConfig(baseEnv({ FRAME_KEY: 'changemechangeme' })), /well-known placeholder/);
+  assert.throws(() => loadConfig(baseEnv({ FRAME_KEY: 'aaaaaaaaaaaaaaaaaa' })), /distinct characters/);
+  assert.throws(() => loadConfig(baseEnv({ HA_BASE_URL: 'ftp://ha.internal/' })), /http: or https:/);
+  assert.throws(() => loadConfig(baseEnv({ HA_BASE_URL: 'http://u:p@ha.internal/' })), /must not embed credentials/);
+  assert.throws(() => loadConfig(baseEnv({ PORT: '80.5' })), /must be an integer/);
+  assert.throws(() => loadConfig(baseEnv({ ENTITY_ALBUM: 'not-an-entity' })), /domain\.object_id/);
+});
+
+test('a duplicate fallback URL collapses to a single route', () => {
+  const config = loadConfig(baseEnv({ HA_BASE_URL_FALLBACK: 'http://ha.internal:8123' }));
+  assert.equal(config.haRoutes.length, 1);
+});
+
+test('a distinct fallback URL adds a second route', () => {
+  const config = loadConfig(baseEnv({ HA_BASE_URL_FALLBACK: 'https://ha.example.net/' }));
+  assert.deepEqual(
+    config.haRoutes.map((route) => route.name),
+    ['primary', 'fallback']
+  );
+});
+
+/* ---------------------------------- auth --------------------------------- */
+
+test('a valid key sets the cookie and never redirects off-origin', () => {
+  const gate = new AuthGate({
+    sessionToken: 'session-token',
+    frameKey: FRAME_KEY,
+    maxFails: 5,
+    windowMs: 60_000
+  });
+
+  const evil = fakeRes();
+  gate.middleware(
+    /** @type {any} */ ({ path: '//evil.example.com', query: { k: FRAME_KEY }, headers: {}, ip: '203.0.113.7' }),
+    evil,
+    () => assert.fail('next() must not run for a redirect')
+  );
+  assert.equal(evil.statusCode, 303);
+  assert.equal(evil.location, '/');
+  assert.match(String(evil.headers['set-cookie']), /^__Host-spf=session-token;/);
+
+  const backslash = fakeRes();
+  gate.middleware(
+    /** @type {any} */ ({ path: '/\\evil.example.com', query: { k: FRAME_KEY }, headers: {}, ip: '203.0.113.7' }),
+    backslash,
+    () => assert.fail('next() must not run for a redirect')
+  );
+  assert.equal(backslash.location, '/');
+
+  const ordinary = fakeRes();
+  gate.middleware(
+    /** @type {any} */ ({ path: '/album', query: { k: FRAME_KEY }, headers: {}, ip: '203.0.113.7' }),
+    ordinary,
+    () => assert.fail('next() must not run for a redirect')
+  );
+  assert.equal(ordinary.location, '/album');
+});
+
+test('an unauthenticated request is rejected and then throttled', () => {
+  const gate = new AuthGate({
+    sessionToken: 's'.repeat(64),
+    frameKey: FRAME_KEY,
+    maxFails: 1,
+    windowMs: 60_000
+  });
+  const req = /** @type {any} */ ({ path: '/', query: {}, headers: {}, ip: '203.0.113.8' });
+
+  const first = fakeRes();
+  gate.middleware(req, first, () => assert.fail('next() must not run unauthenticated'));
+  assert.equal(first.statusCode, 401);
+
+  const second = fakeRes();
+  gate.middleware(req, second, () => assert.fail('next() must not run unauthenticated'));
+  assert.equal(second.statusCode, 429);
+  assert.ok(second.headers['retry-after']);
+});
+
+test('a malformed Cookie header degrades to 401, never to a throw', () => {
+  const gate = new AuthGate({
+    sessionToken: 's'.repeat(64),
+    frameKey: FRAME_KEY,
+    maxFails: 10,
+    windowMs: 60_000
+  });
+  const res = fakeRes();
+  gate.middleware(
+    /** @type {any} */ ({ path: '/', query: {}, headers: { cookie: '__Host-spf=%E0%A4%A' }, ip: '203.0.113.9' }),
+    res,
+    () => assert.fail('next() must not run unauthenticated')
+  );
+  assert.equal(res.statusCode, 401);
+});
+
+test('/healthz stays open even with a bad key present', () => {
+  const gate = new AuthGate({
+    sessionToken: 's'.repeat(64),
+    frameKey: FRAME_KEY,
+    maxFails: 10,
+    windowMs: 60_000,
+    openPaths: ['/healthz']
+  });
+  let passed = false;
+  gate.middleware(
+    /** @type {any} */ ({ path: '/healthz', query: { k: 'wrong-but-long-enough' }, headers: {}, ip: '203.0.113.10' }),
+    fakeRes(),
+    () => {
+      passed = true;
+    }
+  );
+  assert.equal(passed, true);
+});
+
+/* -------------------------------- ha client ------------------------------ */
+
+test('HomeAssistantClient starts with optimistic last-known-good state', () => {
+  const ha = new HomeAssistantClient({
+    routes: [{ name: 'primary', base: 'http://ha.internal:8123' }],
+    token: 'token',
+    entities: {
+      album: 'input_select.a',
+      display: 'input_boolean.b',
+      brightness: 'input_number.c',
+      interval: 'input_number.d'
+    },
+    timeoutMs: 2_000,
+    reprobeEvery: 30
+  });
+
+  const snap = ha.snapshot;
+  assert.equal(snap.haOk, false);
+  assert.equal(snap.haError, 'not polled yet');
+  assert.equal(snap.album, null);
+  assert.equal(snap.display, true);
+  assert.equal(snap.brightness, 100);
+  assert.equal(snap.interval, 15);
+  assert.equal(snap.haVia, 'primary');
+  assert.equal(snap.haLastOk, null);
+});
+
+/* ------------------------------ photo library ---------------------------- */
+
+test('PhotoLibrary skips unsafe entries and sorts naturally', async () => {
+  const root = await tempRoot('scan');
+  try {
+    await fs.mkdir(path.join(root, 'Trip 2020'));
+    await fs.writeFile(path.join(root, 'Trip 2020', 'b2.jpg'), 'x');
+    await fs.writeFile(path.join(root, 'Trip 2020', 'a1.JPG'), 'x');
+    await fs.writeFile(path.join(root, 'Trip 2020', '.hidden.jpg'), 'x');
+    await fs.writeFile(path.join(root, 'Trip 2020', 'notes.txt'), 'x');
+    await fs.mkdir(path.join(root, '.secret'));
+    await fs.mkdir(path.join(root, '__proto__'));
+    await fs.writeFile(path.join(root, 'loose.jpg'), 'x');
+
+    const library = new PhotoLibrary({ root, maxPhotosPerAlbum: 100 });
+    await library.scan();
+    const snap = library.snapshot;
+
+    assert.equal(snap.ok, true);
+    assert.deepEqual(Object.keys(snap.albums), ['Trip 2020']);
+    assert.deepEqual(snap.albums['Trip 2020'], [
+      'photos/Trip%202020/a1.JPG',
+      'photos/Trip%202020/b2.jpg'
+    ]);
+    assert.equal(snap.photoCount, 2);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('the per-album cap selects a deterministic sorted subset', async () => {
+  const root = await tempRoot('cap');
+  try {
+    await fs.mkdir(path.join(root, 'Album'));
+    for (const name of ['5.jpg', '3.jpg', '1.jpg', '4.jpg', '2.jpg']) {
+      await fs.writeFile(path.join(root, 'Album', name), 'x');
+    }
+
+    const library = new PhotoLibrary({ root, maxPhotosPerAlbum: 2 });
+    await library.scan();
+
+    assert.deepEqual(library.snapshot.albums.Album, ['photos/Album/1.jpg', 'photos/Album/2.jpg']);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('an unreadable photo root reports unhealthy without throwing', async () => {
+  const missing = path.join(os.tmpdir(), `spf-missing-${process.pid}-${Date.now()}`);
+  const library = new PhotoLibrary({ root: missing, maxPhotosPerAlbum: 10 });
+  await library.scan();
+
+  const snap = library.snapshot;
+  assert.equal(snap.ok, false);
+  assert.match(String(snap.error), /cannot read PHOTOS_DIR/);
+  assert.equal(snap.albumCount, 0);
+});
+```
+
+```markdown final-review.md
+# Final Review — smart-photo-frame (run 1 server)
+
+Reviewers: `gpt-5.6-sol` (code quality / documentation / tests), `gemini-3.6-flash` (security / correctness).
+Decision authority: lead engineer synthesis. Priority order applied: **brand fidelity > security > correctness > performance > style**.
+
+## Brand fidelity
+
+No brand guide was supplied with this task and neither review proposed a colour, font, spacing or copy change. Nothing brand-bearing was touched:
+
+- The Content-Security-Policy string, including the deliberate `'unsafe-inline'` grants for `script-src`/`style-src`, is unchanged. The inline allowance is a documented Safari-12 constraint, not an oversight, and no external origin is permitted anywhere in the policy.
+- All user-visible copy (`Unauthorized\n`, `Too Many Requests\n`, `Not Found\n`, `Method Not Allowed\n`) is unchanged. The only *new* strings are generic status bodies added where the server previously lied about the status (see A9), and they follow the existing one-word-per-status style.
+- The header comment block, the `__Host-spf` cookie name, the 400-day kiosk cookie lifetime and the "never blank the frame" behaviour are all preserved.
+
+---
+
+## A. Triage
+
+### Accepted (applied)
+
+| # | Source | Finding | Decision | Rationale |
+|---|--------|---------|----------|-----------|
+| A1 | Gemini | Open redirect: `res.redirect(303, req.path)` emits `//evil.example` / `/\evil.example` verbatim as a protocol-relative `Location`. | **ACCEPT** | Verified real. Express does not normalise the request target, and `res.location()` only URL-encodes. A frame that already holds a valid session cookie is redirected off-origin by any link of the form `https://frame/​//evil.example?k=x` — a phishing primitive against the one browser we care about. Fixed with a new `safeRedirectTarget()`: anything that is not an unambiguous single-slash path (or that contains control characters) collapses to `/`. Cheap, no behaviour change for legitimate paths. |
+| A2 | GPT | `poll()` marks a route healthy when every entity request returned an unusable HTTP response (e.g. four `401`s): `haOk = true`, `haLastOk` advanced. | **ACCEPT** | Real observability/correctness defect. `HaResponseError.reachable === true` conflates "HA answered" with "HA gave us state". `/healthz` and `/api/state` would report green with a revoked token. Now: reachability still stops route flapping (a bad token would fail identically on the fallback), but `haOk` and `haLastOk` are driven by whether any entity state was actually parsed, and `haError` says `no usable entity states` otherwise. |
+| A3 | GPT | Transport failures are silently dropped when any sibling request succeeds. | **ACCEPT** | Correctness. Three of four entities timing out is a degraded poll, and the operator must see it. Every failure — transport or HTTP — is now pushed into `problems` with its entity id; `transportError` is retained separately for the route-level `error` string. |
+| A4 | GPT | `Number.parseFloat` accepts `"50abc"` / `"15 seconds"`, letting malformed HA data overwrite last-known-good values. | **ACCEPT** | Correctness. Added `parseFiniteState()` (trim → reject empty → `Number()` → require finite). `"Infinity"`, `"NaN"`, `"50abc"` and whitespace now all preserve the previous value, matching the module's stated "never blank the frame" contract. |
+| A5 | GPT | Per-album cap applied before sorting, so which photos are shown depends on `readdir` order. | **ACCEPT (modified)** | Accepted the determinism fix (collect → sort → cap), which also fixes the misleading "cap reached" log. **Modified**: GPT's version removed the only bound on in-memory candidate names. Added `HARD_ALBUM_SCAN_LIMIT = 200_000`, equal to the maximum `MAX_PHOTOS_PER_ALBUM` permits, so any validly configured album is sorted in full while a pathological directory is truncated and logged rather than exhausting the heap. |
+| A6 | GPT | 1 MiB HA response limit only checks `Content-Length`; chunked/absent-header bodies are unbounded. | **ACCEPT** | Security (memory exhaustion from a compromised or faulty HA endpoint, on the process holding the crown-jewel token). Added `readJsonLimited()`, which enforces the ceiling on bytes actually read and cancels the stream on overrun. The `Content-Length` check is retained as a cheap early reject. Also added `discardBody()` so non-2xx and oversized responses release their socket instead of waiting on GC. |
+| A7 | GPT | `TRUST_PROXY` defaults to `1`, so a directly exposed instance lets clients name their own `req.ip` and evade per-IP throttling. | **ACCEPT** | Security beats availability in this threat model. Default is now `false`. The failure mode of the safe default (all clients collapse onto the proxy address, i.e. *stricter* throttling) costs frame availability, which the header comment ranks lowest; the failure mode of the old default costs brute-force protection on the only secret guarding the photographs. The effective value is now logged in the `listening` line so a misconfiguration is visible in one grep. **See E4 — deployment config must be updated in the same change.** |
+| A8 | GPT | JSDoc cast references `this.entities`, which does not exist (`#entities`), breaking `checkJs`. | **ACCEPT** | Replaced with explicit `EntityRole` / `EntityMap` typedefs, reused by `FrameConfig.entities` and the `HomeAssistantClient` constructor. Documents the role-keyed design instead of leaking a private field name into public docs. |
+| A9 | GPT | Error handler returns `Internal Server Error` for non-400 4xx (e.g. a `404` or `416` from `sendFile`). | **ACCEPT** | Correctness and honesty of the API surface, with no information disclosure: added a small `STATUS_BODIES` map plus a `Request Error` / `Internal Server Error` fallback by status class. Still no stack traces, no paths. |
+| A10 | GPT | No `test` script despite security-sensitive logic. | **ACCEPT (in part)** | Added `"test": "node --test"` **and** `test/smoke.test.js` so the script is green and meaningful on a fresh clone. A script pointing at zero tests would have been worse than none. The lint/`tsc --checkJs` half is escalated (E3) — it needs devDependencies, config files and a lockfile update that are out of this change's scope. |
+| A11 | Lead | `shutdown()` could run twice on closely spaced `SIGINT`/`SIGTERM`. | **ACCEPT** | Called out in GPT's coverage list but not filed as a defect. A second `server.close()` on a closed server passes `ERR_SERVER_NOT_RUNNING` to the callback and immediately `process.exit(0)`s, truncating in-flight responses. Added a one-line idempotence guard. |
+
+### Rejected
+
+| # | Source | Finding | Rationale |
+|---|--------|---------|-----------|
+| R1 | GPT | Add ESLint / `tsc --checkJs` to `scripts`. | **REJECT as written** (escalated as E3). Adding a script whose binary is not installed produces a broken `npm run lint`; adding the devDependency changes `package-lock.json`, which the run notes explicitly place under the Dockerfile/`npm ci` contract. Not a code defect — a tooling decision with build-pipeline blast radius. |
+| R2 | GPT | Replace the per-album cap logic with the suggested snippet verbatim. | **PARTIALLY REJECTED** — see A5. The determinism goal is accepted; the unbounded accumulation in the proposed snippet is not. |
+| R3 | Gemini | Implied concern that `req.path` reaching `Location` leaks the key. | **REJECT** — not a defect. `req.path` excludes the query string, so `?k=` never reaches `Location`, browser history or a proxy log. `Referrer-Policy: no-referrer` covers the `Referer` path. The genuine issue in the same code was the origin escape (A1), which is fixed. |
+
+### Escalated — [HUMAN REVIEW NEEDED]
+
+| # | Item | Why it is escalated |
+|---|------|---------------------|
+| E1 | **[HUMAN REVIEW NEEDED]** `scripts/run.py:39` — launching a missing or non-executable `VENV_PYTHON` raises an uncaught `OSError` and prints a traceback instead of the concise configuration error used for a missing orchestrator. | The finding looks correct, but `scripts/run.py` was **not included in the provided source**. I will not author a file I cannot read; blind-patching a pipeline entry point risks breaking the orchestrator contract. Recommended fix for the owner: `os.access(VENV_PYTHON, os.X_OK)` pre-check, or wrap the launch in `except OSError` and emit the existing single-line config-error format, then exit non-zero. |
+| E2 | **[HUMAN REVIEW NEEDED]** `src/index.js` — inert generated placeholder; `package.json` `main` points at `server.js`. | Also not provided. Deleting a file is not expressible through this change format, and I will not silently repoint `main`. Recommendation: delete `src/index.js`. It is dead code today, and an ambiguous second entry point is exactly the kind of thing that later gets imported by accident. |
+| E3 | **[HUMAN REVIEW NEEDED]** Lint / type-check tooling (ESLint or `tsc --checkJs`). | Requires devDependencies, a config file, a `package-lock.json` update and a CI decision. The codebase is already JSDoc-annotated well enough that `checkJs` is realistic and worth doing — A8 removed the one cast that would have failed it — but it belongs in its own change with the lockfile and Dockerfile (`npm ci`) touched together. |
+| E4 | **[HUMAN REVIEW NEEDED]** Deployment configuration must set `TRUST_PROXY=1` now that the default is `false` (A7). | `.env.example`, the README and the compose/Dockerfile were not provided, so I could not update them alongside the code. **This is a coupled change:** if the VPS deployment behind the reverse proxy is not given `TRUST_PROXY=1`, every client collapses into a single throttle bucket and one noisy scanner can lock the iPad out for `AUTH_WINDOW_MS`. Fail-safe rather than fail-open, and the new `trustProxy` field in the `listening` log makes it obvious, but it must not ship without the env change. |
+| E5 | **[HUMAN REVIEW NEEDED]** Gemini's review is truncated mid-finding: it ends at `Look at CONTENT_`, with a stated intent to examine the CSP and static file serving. | An incomplete audit of the CSP and `express.static` mount cannot be closed out on my authority. Manual pass found nothing actionable: `default-src 'none'` with same-origin-only allowances, `frame-ancestors 'none'` plus legacy `X-Frame-Options`, `base-uri 'none'`, `form-action 'none'`, `dotfiles: 'ignore'`, `redirect: false` (so the static mount cannot itself emit a directory redirect), and the whole mount sits *behind* `gate.middleware`. The `'unsafe-inline'` grants are a documented Safari-12 tradeoff, not a regression, and must not be "fixed" by a reviewer who has not read the header comment. Re-run the security pass to completion before merge if the truncation was accidental. |
+| E6 | **[HUMAN REVIEW NEEDED]** GPT's full test matrix (HA failover/reprobe cycles, oversized and chunked HA bodies, redirect-never-forwards-token, encoded-traversal and symlink-escape rejection on `/photos`, bucket-cap eviction, `/healthz` 503 path, port-in-use startup, loop non-overlap). | `test/smoke.test.js` covers the boot trust boundary, the auth gate (including a regression test for the A1 open redirect and the A7 default), and photo-library containment/determinism (including a regression test for A5). The remaining matrix needs a `fetch` interception strategy and a supertest-style HTTP harness — i.e. the devDependency decision in E3. Tracked, not silently dropped. |
+
+---
+
+## B. Final state
+
+### Files changed
+- **`server.js`** — A1–A9, A11.
+- **`package.json`** — `test` script (A10).
+- **`test/smoke.test.js`** — new; 13 tests, zero dependencies (A10).
+
+### Files deliberately untouched
+- `scripts/run.py`, `src/index.js` — not supplied (E1, E2).
+- `public/*` — produced by run 2; the static mount and the run-2 contract (page-relative `photos/<album>/<file>` URLs, `credentials: 'same-origin'`, inline-only scripting) are unchanged.
+
+### Security posture after this change
+- HA bearer token: still server-side only; `redirect: 'error'` retained, response bodies now hard-bounded while reading, unread bodies explicitly cancelled.
+- Auth: throttling is now keyed on an address a client cannot forge unless the operator opts in; redirect target is origin-locked; malformed cookies still degrade to `401`.
+- Photo serving: unchanged allowlist + `realpath` containment; album contents are now stable across rescans.
+- Availability: last-known-good state is still served indefinitely, and every accepted change to the HA client preserves previous values on bad input rather than blanking the frame.
+
+### Merge gate
+Blocking: **E4** (ship the `TRUST_PROXY=1` deployment change with this commit). Recommended before merge: **E5** (complete the truncated security review). E1–E3 and E6 are follow-ups and do not block.
+```
