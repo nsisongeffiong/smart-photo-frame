@@ -1,0 +1,1353 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!--
+  smart-photo-frame — client page
+  ==============================================================================
+  TARGET: iPad Air 1, iOS 12.5.7, Safari 12. This device will never receive
+  another OS update and there is NO BUILD STEP: this file is served exactly as
+  written. Before editing, read the rules below.
+
+    * JavaScript: ES5 only (var, function, no classes needed). Explicitly
+      FORBIDDEN: optional chaining (?.), nullish coalescing (??), arrow
+      functions, template literals, let/const, async/await, spread, modules,
+      Object.entries, Array.prototype.flat, String.padStart, globalThis.
+      Safari 12 either fails to parse them or silently misbehaves; a parse
+      error here means a black rectangle on someone's wall.
+    * CSS: no flexbox `gap`, no `aspect-ratio`, no `:is()`/`:where()`, no CSS
+      nesting, no `inset` shorthand. Always ship the -webkit- prefix for
+      filter, transition, transform, animation and backface-visibility.
+    * MEMORY: 1 GB total, shared with the OS. At most TWO photo layers live in
+      the DOM at once, exactly ONE image is preloaded ahead, the outgoing layer
+      is destroyed after every crossfade, and the page reloads on a long timer
+      so leaked bitmaps cannot accumulate.
+    * SECURITY: album names and error strings come from the filesystem and from
+      a Home Assistant dropdown and are UNTRUSTED. Everything interpolated into
+      the diagnostics panel goes through esc(). Album names are used as object
+      keys, so every lookup is guarded with Object.prototype.hasOwnProperty.
+      Images are built with document.createElement + .src, never from HTML
+      strings. This page holds NO credential of any kind and NEVER talks to
+      Home Assistant directly — only to the same-origin bridge, which
+      authenticates us with a cookie it already set.
+  ==============================================================================
+-->
+<meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Photo Frame">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="format-detection" content="telephone=no, date=no, address=no, email=no">
+<title>Photo Frame</title>
+<style>
+/* ---------------------------------------------------------------------------
+   Layout is z-index based, not DOM-order based: photo layers are appended to
+   #stage at runtime and must sit UNDER the clock, dim overlay and diagnostics.
+   No flexbox gap / aspect-ratio / :is() — none of them are safe on Safari 12.
+   --------------------------------------------------------------------------- */
+html, body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  background: #000;
+  overflow: hidden;
+}
+body {
+  position: fixed;            /* kills rubber-band scrolling in standalone mode */
+  top: 0; left: 0; right: 0; bottom: 0;
+  color: #fff;
+  font-family: -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif;
+  -webkit-text-size-adjust: 100%;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: rgba(0, 0, 0, 0);
+}
+#stage {
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  overflow: hidden;
+  background: #000;
+}
+
+/* --- photo layers ---------------------------------------------------------- */
+.layer {
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 1;
+  opacity: 0;
+  overflow: hidden;
+  -webkit-transition-property: opacity;
+  transition-property: opacity;
+  -webkit-transition-timing-function: linear;
+  transition-timing-function: linear;
+  -webkit-transform: translateZ(0);          /* force a compositing layer */
+  transform: translateZ(0);
+  -webkit-backface-visibility: hidden;
+  backface-visibility: hidden;
+}
+.layer.visible { opacity: 1; }
+
+/* Blurred, darkened copy of the same photo fills the letterbox bars. The
+   source is a tiny canvas-downscaled JPEG (see makeBackdropSrc) so the A7 GPU
+   blurs a 64px bitmap instead of a full-resolution photo. */
+.layer .backdrop {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  min-width: 100%;
+  min-height: 100%;
+  -webkit-transform: translate(-50%, -50%) scale(1.2);
+  transform: translate(-50%, -50%) scale(1.2);
+  -webkit-filter: blur(26px) brightness(0.42) saturate(1.1);
+  filter: blur(26px) brightness(0.42) saturate(1.1);
+  -webkit-backface-visibility: hidden;
+  backface-visibility: hidden;
+}
+
+/* Contain-without-cropping using the margin:auto centring trick, which needs
+   no object-fit support and no layout maths. */
+.layer .photo {
+  position: absolute;
+  top: 0; right: 0; bottom: 0; left: 0;
+  margin: auto;
+  max-width: 100%;
+  max-height: 100%;
+  display: block;
+  -webkit-backface-visibility: hidden;
+  backface-visibility: hidden;
+}
+
+/* Ken Burns is OFF by default: it is expensive on this GPU. */
+@-webkit-keyframes spf-kenburns {
+  from { -webkit-transform: scale(1) translate(0, 0); }
+  to   { -webkit-transform: scale(1.07) translate(-1.4%, -1.2%); }
+}
+@keyframes spf-kenburns {
+  from { transform: scale(1) translate(0, 0); }
+  to   { transform: scale(1.07) translate(-1.4%, -1.2%); }
+}
+.layer.kb .photo {
+  -webkit-transform-origin: 50% 50%;
+  transform-origin: 50% 50%;
+  -webkit-animation: spf-kenburns 34s ease-in-out 0s 1 forwards;
+  animation: spf-kenburns 34s ease-in-out 0s 1 forwards;
+}
+
+/* --- clock (sits under the dim overlay so brightness applies to it too) ----- */
+#clock {
+  position: absolute;
+  right: 30px;
+  bottom: 24px;
+  z-index: 2;
+  font-size: 34px;
+  font-weight: 200;
+  letter-spacing: 1px;
+  color: rgba(255, 255, 255, 0.85);
+  text-shadow: 0 2px 14px rgba(0, 0, 0, 0.7);
+  display: none;
+}
+#clock.on { display: block; }
+
+/* --- status message (no photos / bridge down) ------------------------------ */
+#msg {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  right: 0;
+  z-index: 2;
+  margin-top: -30px;
+  text-align: center;
+  display: none;
+}
+#msg.on { display: block; }
+#msgText {
+  display: inline-block;
+  padding: 16px 26px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(255, 255, 255, 0.75);
+  font-size: 22px;
+  font-weight: 300;
+}
+
+/* --- brightness: a black overlay, never a CSS filter ----------------------- */
+#dim {
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  z-index: 3;
+  background: #000;
+  opacity: 1;
+  pointer-events: none;
+  -webkit-transition-property: opacity;
+  transition-property: opacity;
+  -webkit-transition-timing-function: linear;
+  transition-timing-function: linear;
+}
+
+/* --- diagnostics ----------------------------------------------------------- */
+#diag {
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  z-index: 9;
+  display: none;
+  padding: 26px 32px;
+  -webkit-box-sizing: border-box;
+  box-sizing: border-box;
+  background: rgba(0, 0, 0, 0.9);
+  color: #fff;
+  font-size: 17px;
+  line-height: 1.45;
+  overflow: hidden;
+}
+#diag.on { display: block; }
+.d-title {
+  font-size: 21px;
+  font-weight: 500;
+  letter-spacing: 0.5px;
+  padding-bottom: 10px;
+  margin-bottom: 8px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.18);
+}
+.d-row {
+  display: block;
+  padding: 4px 0;
+  overflow: hidden;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+}
+.d-k {
+  display: inline-block;
+  width: 30%;
+  vertical-align: top;
+  color: #8ea9c6;
+}
+.d-v {
+  display: inline-block;
+  width: 68%;
+  vertical-align: top;
+  color: #fff;
+  word-wrap: break-word;
+  word-break: break-word;
+}
+.d-v.ok { color: #66d68a; }
+.d-v.bad { color: #ff7070; }
+.d-v.warn { color: #ffc861; }
+.d-foot {
+  padding-top: 12px;
+  color: rgba(255, 255, 255, 0.45);
+  font-size: 15px;
+}
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="clock"></div>
+  <div id="msg"><div id="msgText"></div></div>
+  <div id="dim"></div>
+  <div id="diag"></div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  /* =========================================================================
+     CONFIG — everything tunable lives here.
+     ========================================================================= */
+  var CONFIG = {
+
+    /* Bridge polling ------------------------------------------------------- */
+    stateUrl: 'api/state',        /* relative to this page; cookie auth only  */
+    pollIntervalMs: 15000,
+    requestTimeoutMs: 10000,
+    bridgeFailuresBeforeFallback: 2,
+
+    /* Slideshow ------------------------------------------------------------ */
+    transitionMs: 1200,           /* crossfade duration                       */
+    dimFadeMs: 1500,              /* brightness / display fade duration       */
+    defaultIntervalSec: 45,
+    minIntervalSec: 5,
+    maxIntervalSec: 3600,
+    imageLoadTimeoutMs: 9000,     /* a stalled photo is skipped, not waited on*/
+    skipDelayMs: 200,             /* how fast a failed photo is skipped       */
+    errorRetryMs: 20000,          /* pause after a run of consecutive failures*/
+    maxConsecutiveFailures: 12,
+    wakeDelayMs: 120,
+
+    /* Backdrop sampling ---------------------------------------------------- */
+    backdropSampleWidth: 64,      /* blur a 64px bitmap, not a 12 MP one      */
+    backdropQuality: 0.72,
+
+    /* Housekeeping --------------------------------------------------------- */
+    scheduleTickMs: 30000,        /* re-evaluate schedule / reload / clock    */
+    reloadEveryMs: 4 * 60 * 60 * 1000,  /* keep memory flat on a 1 GB device  */
+
+    /* Offline album cache (paths only — never credentials) ------------------ */
+    cacheKey: 'spf.album.v1',
+    cacheMaxPhotos: 800,
+    cacheMaxChars: 400000,
+    cacheBootstrapDelayMs: 2500,
+
+    /* Diagnostics ---------------------------------------------------------- */
+    diag: {
+      tapsToOpen: 3,
+      tapWindowMs: 900,
+      autoHideMs: 45000,
+      refreshMs: 1000,
+      maxValueChars: 180
+    },
+
+    /* Feature toggles ------------------------------------------------------ */
+    features: {
+      clock: true,
+      clock24h: true,
+      kenBurns: false,            /* default OFF: expensive on this GPU       */
+      blurredBackdrop: true,
+      cacheAlbums: true,
+      diagnostics: true
+    },
+
+    /* Fallback time-of-day schedule, used whenever the bridge is unreachable.
+       Entries are evaluated as "the latest `at` that is <= now", wrapping over
+       midnight. A bridge outage must never leave a black rectangle on a wall. */
+    fallbackSchedule: {
+      album: 'family',
+      intervalSec: 45,
+      entries: [
+        { at: '06:30', display: true,  brightness: 65 },
+        { at: '09:00', display: true,  brightness: 95 },
+        { at: '18:00', display: true,  brightness: 70 },
+        { at: '21:30', display: true,  brightness: 35 },
+        { at: '23:00', display: false, brightness: 10 }
+      ]
+    }
+  };
+
+  /* =========================================================================
+     Small ES5 utilities
+     ========================================================================= */
+
+  /* C1: every untrusted value rendered in the diagnostics panel goes through
+     this. An album directory literally named <img src=x onerror=alert(1)>
+     must appear as text, not execute. */
+  function esc(value) {
+    var s = (value === null || value === undefined) ? '' : String(value);
+    return s
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;')
+      .replace(/\//g, '&#47;');
+  }
+
+  /* C2: album names become object keys. "constructor", "toString" and
+     "__proto__" must never resolve to something inherited from the
+     prototype chain. */
+  function hasOwn(obj, key) {
+    return !!obj && typeof obj === 'object' &&
+      Object.prototype.hasOwnProperty.call(obj, key);
+  }
+
+  function ownKeys(obj) {
+    var out = [];
+    if (!obj || typeof obj !== 'object') { return out; }
+    var keys = Object.keys(obj);
+    var i;
+    for (i = 0; i < keys.length; i++) {
+      if (hasOwn(obj, keys[i])) { out.push(keys[i]); }
+    }
+    return out;
+  }
+
+  function isArray(v) {
+    return Object.prototype.toString.call(v) === '[object Array]';
+  }
+
+  function num(v, fallback) {
+    var n = (typeof v === 'number') ? v : parseFloat(v);
+    return (typeof n === 'number' && isFinite(n)) ? n : fallback;
+  }
+
+  function clamp(n, lo, hi) {
+    if (n < lo) { return lo; }
+    if (n > hi) { return hi; }
+    return n;
+  }
+
+  function pad2(n) {
+    return (n < 10 ? '0' : '') + n;
+  }
+
+  function trunc(s, max) {
+    var str = String(s);
+    return str.length > max ? (str.slice(0, max) + '…') : str;
+  }
+
+  function shuffle(arr) {
+    var i, j, tmp;
+    for (i = arr.length - 1; i > 0; i--) {
+      j = Math.floor(Math.random() * (i + 1));
+      tmp = arr[i];
+      arr[i] = arr[j];
+      arr[j] = tmp;
+    }
+    return arr;
+  }
+
+  function fmtDuration(ms) {
+    if (!isFinite(ms) || ms < 0) { return '—'; }
+    var s = Math.floor(ms / 1000);
+    var d = Math.floor(s / 86400); s -= d * 86400;
+    var h = Math.floor(s / 3600);  s -= h * 3600;
+    var m = Math.floor(s / 60);    s -= m * 60;
+    if (d > 0) { return d + 'd ' + h + 'h ' + m + 'm'; }
+    if (h > 0) { return h + 'h ' + m + 'm'; }
+    if (m > 0) { return m + 'm ' + s + 's'; }
+    return s + 's';
+  }
+
+  /* Photo paths come from the bridge, already URL-encoded. We still refuse
+     anything that is not a same-origin relative path: no scheme (javascript:,
+     data:), no protocol-relative //host, no absolute /path. */
+  function isSafeRelativePath(p) {
+    if (typeof p !== 'string' || p.length === 0) { return false; }
+    if (p.charAt(0) === '/') { return false; }
+    if (p.indexOf('//') === 0) { return false; }
+    if (/^[a-zA-Z][a-zA-Z0-9+.\-]*:/.test(p)) { return false; }
+    return true;
+  }
+
+  function parseHhMm(s) {
+    if (typeof s !== 'string') { return null; }
+    var m = /^([0-9]{1,2}):([0-9]{2})$/.exec(s);
+    if (!m) { return null; }
+    var h = parseInt(m[1], 10);
+    var mi = parseInt(m[2], 10);
+    if (h < 0 || h > 23 || mi < 0 || mi > 59) { return null; }
+    return h * 60 + mi;
+  }
+
+  /* =========================================================================
+     DOM references
+     ========================================================================= */
+  var stageEl = document.getElementById('stage');
+  var dimEl   = document.getElementById('dim');
+  var clockEl = document.getElementById('clock');
+  var msgEl   = document.getElementById('msg');
+  var msgTextEl = document.getElementById('msgText');
+  var diagEl  = document.getElementById('diag');
+
+  /* =========================================================================
+     Runtime state
+     ========================================================================= */
+  var app = {
+    startedAt: Date.now(),
+
+    /* bridge */
+    bridgeOk: false,
+    bridgeFailures: 0,
+    lastStateAt: null,
+    lastPollError: '',
+    state: null,               /* last good, normalised bridge state          */
+    settingsSource: 'fallback schedule',
+
+    /* offline cache */
+    cache: null,               /* { album: string, photos: [] , at: string }  */
+    cacheNote: 'not used',
+    bootstrapped: false,
+
+    /* playlist */
+    albumName: null,
+    playlist: [],
+    playIndex: -1,
+    playlistSig: '',
+    currentUrl: '',
+
+    /* display */
+    displayOn: false,
+    brightness: 100,
+    intervalSec: CONFIG.defaultIntervalSec,
+
+    /* layers & loading */
+    currentLayer: null,
+    pendingOld: null,
+    preload: null,
+    loading: false,
+    loadToken: 0,
+    failStreak: 0,
+    totalFailures: 0,
+    shownCount: 0,
+
+    /* timers */
+    photoTimer: null,
+    pollTimer: null,
+    transitionTimer: null,
+    diagTimer: null,
+
+    /* misc */
+    pendingReload: false,
+    lastScriptError: ''
+  };
+
+  /* =========================================================================
+     Image loading (C3: elements are created, never parsed from HTML strings)
+     ========================================================================= */
+
+  function releaseImg(img) {
+    if (!img) { return; }
+    img.onload = null;
+    img.onerror = null;
+    /* removeAttribute, not src = '': assigning an empty string makes Safari
+       re-request the page URL as an image. */
+    try { img.removeAttribute('src'); } catch (e) { /* detached node */ }
+  }
+
+  /* Returns a handle: { url, img, state:'loading'|'ok'|'error', cbs:[] } */
+  function loadPhoto(url) {
+    var handle = { url: url, img: null, state: 'loading', cbs: [] };
+    var img = new Image();
+    var timer = null;
+
+    function settle(result) {
+      if (handle.state !== 'loading') { return; }
+      if (timer) { clearTimeout(timer); timer = null; }
+      img.onload = null;
+      img.onerror = null;
+      handle.state = result;
+      var cbs = handle.cbs;
+      handle.cbs = [];
+      var i;
+      for (i = 0; i < cbs.length; i++) { cbs[i](handle); }
+    }
+
+    img.onload = function () { settle('ok'); };
+    img.onerror = function () { settle('error'); };
+    timer = setTimeout(function () { settle('error'); }, CONFIG.imageLoadTimeoutMs);
+
+    handle.img = img;
+    img.setAttribute('alt', '');
+    img.src = url;                       /* assign .src — no markup building  */
+    return handle;
+  }
+
+  function whenSettled(handle, cb) {
+    if (handle.state === 'loading') { handle.cbs.push(cb); }
+    else { cb(handle); }
+  }
+
+  function releasePreload() {
+    if (app.preload) {
+      app.preload.cbs = [];
+      releaseImg(app.preload.img);
+      app.preload = null;
+    }
+  }
+
+  /* Downscale to a tiny canvas and blur that instead of the full photo. Same
+     origin, so the canvas is never tainted. Falls back to the photo itself. */
+  function makeBackdropSrc(img) {
+    if (!CONFIG.features.blurredBackdrop) { return null; }
+    var nw = img.naturalWidth || img.width;
+    var nh = img.naturalHeight || img.height;
+    if (!nw || !nh) { return img.src; }
+    try {
+      var w = CONFIG.backdropSampleWidth;
+      var h = Math.max(1, Math.round(w * (nh / nw)));
+      var canvas = document.createElement('canvas');
+      canvas.width = w;
+      canvas.height = h;
+      var ctx = canvas.getContext('2d');
+      if (!ctx) { return img.src; }
+      ctx.drawImage(img, 0, 0, w, h);
+      return canvas.toDataURL('image/jpeg', CONFIG.backdropQuality);
+    } catch (e) {
+      /* Canvas unavailable or out of memory: use the photo itself. */
+      return img.src;
+    }
+  }
+
+  /* =========================================================================
+     Layer management — never more than two layers in the DOM
+     ========================================================================= */
+
+  function buildLayer(photoImg) {
+    var layer = document.createElement('div');
+    layer.className = 'layer' + (CONFIG.features.kenBurns ? ' kb' : '');
+    layer.style.webkitTransitionDuration = CONFIG.transitionMs + 'ms';
+    layer.style.transitionDuration = CONFIG.transitionMs + 'ms';
+
+    var backdropSrc = makeBackdropSrc(photoImg);
+    if (backdropSrc) {
+      var bd = document.createElement('img');
+      bd.className = 'backdrop';
+      bd.setAttribute('alt', '');
+      bd.src = backdropSrc;
+      layer.appendChild(bd);
+    }
+
+    photoImg.className = 'photo';
+    layer.appendChild(photoImg);
+    return layer;
+  }
+
+  function destroyLayer(layer) {
+    if (!layer) { return; }
+    var imgs = layer.getElementsByTagName('img');
+    var i;
+    for (i = imgs.length - 1; i >= 0; i--) { releaseImg(imgs[i]); }
+    if (layer.parentNode) { layer.parentNode.removeChild(layer); }
+  }
+
+  function showLayer(layer) {
+    /* If a previous crossfade has not been cleaned up yet, clean it up NOW so
+       the DOM never holds three decoded photos at once. */
+    if (app.pendingOld) {
+      clearTimeout(app.transitionTimer);
+      destroyLayer(app.pendingOld);
+      app.pendingOld = null;
+    }
+
+    var outgoing = app.currentLayer;
+    stageEl.appendChild(layer);
+
+    /* Force a style flush so Safari 12 actually animates the opacity change
+       instead of collapsing both styles into one frame. */
+    /* jshint -W030 */
+    var reflow = layer.offsetHeight;
+    if (reflow < 0) { return; }
+    /* jshint +W030 */
+
+    layer.className = layer.className + ' visible';
+    app.currentLayer = layer;
+
+    if (outgoing) {
+      app.pendingOld = outgoing;
+      app.transitionTimer = setTimeout(function () {
+        destroyLayer(app.pendingOld);
+        app.pendingOld = null;
+      }, CONFIG.transitionMs + 150);
+    }
+  }
+
+  /* =========================================================================
+     Message + brightness + clock
+     ========================================================================= */
+
+  function showMessage(text) {
+    msgTextEl.textContent = text;      /* textContent: never innerHTML here   */
+    if (msgEl.className.indexOf('on') === -1) { msgEl.className = 'on'; }
+  }
+
+  function hideMessage() {
+    if (msgEl.className.indexOf('on') !== -1) { msgEl.className = ''; }
+  }
+
+  /* Brightness is a black overlay at variable opacity, not a CSS filter.
+     display:false fades fully to black — iOS gives a web page no way to sleep
+     the backlight, so black is the only "off" available to us. */
+  function applyDim(displayOn, brightness) {
+    var opacity = displayOn ? (1 - (clamp(num(brightness, 100), 0, 100) / 100)) : 1;
+    dimEl.style.opacity = String(Math.round(opacity * 1000) / 1000);
+  }
+
+  function fmtClock(d) {
+    var h = d.getHours();
+    var m = d.getMinutes();
+    var suffix = '';
+    if (!CONFIG.features.clock24h) {
+      suffix = (h < 12) ? ' AM' : ' PM';
+      h = h % 12;
+      if (h === 0) { h = 12; }
+      return h + ':' + pad2(m) + suffix;
+    }
+    return pad2(h) + ':' + pad2(m);
+  }
+
+  function updateClock() {
+    if (!CONFIG.features.clock) {
+      clockEl.className = '';
+      return;
+    }
+    clockEl.className = 'on';
+    var text = fmtClock(new Date());
+    if (clockEl.textContent !== text) { clockEl.textContent = text; }
+  }
+
+  /* =========================================================================
+     Fallback time-of-day schedule
+     ========================================================================= */
+
+  function scheduleNow(now) {
+    var entries = CONFIG.fallbackSchedule.entries;
+    var minutes = now.getHours() * 60 + now.getMinutes();
+    var parsed = [];
+    var i, at;
+
+    for (i = 0; i < entries.length; i++) {
+      at = parseHhMm(entries[i].at);
+      if (at !== null) {
+        parsed.push({ at: at, label: entries[i].at, entry: entries[i] });
+      }
+    }
+    if (!parsed.length) {
+      return {
+        display: true,
+        brightness: 100,
+        label: 'no valid schedule entries'
+      };
+    }
+    parsed.sort(function (a, b) { return a.at - b.at; });
+
+    var chosen = parsed[parsed.length - 1];   /* wrap: last entry of yesterday */
+    for (i = 0; i < parsed.length; i++) {
+      if (parsed[i].at <= minutes) { chosen = parsed[i]; }
+    }
+    return {
+      display: chosen.entry.display !== false,
+      brightness: clamp(num(chosen.entry.brightness, 100), 0, 100),
+      label: 'from ' + chosen.label
+    };
+  }
+
+  /* =========================================================================
+     Bridge state
+     ========================================================================= */
+
+  function normalizeState(raw) {
+    return {
+      album: (typeof raw.album === 'string' && raw.album) ? raw.album : null,
+      display: raw.display !== false,
+      brightness: clamp(num(raw.brightness, 100), 0, 100),
+      interval: clamp(num(raw.interval, CONFIG.defaultIntervalSec),
+                      CONFIG.minIntervalSec, CONFIG.maxIntervalSec),
+      haOk: raw.haOk === true,
+      haError: (typeof raw.haError === 'string') ? raw.haError : '',
+      haVia: (typeof raw.haVia === 'string') ? raw.haVia : '',
+      haLastOk: (typeof raw.haLastOk === 'string') ? raw.haLastOk : null,
+      albums: (raw.albums && typeof raw.albums === 'object' && !isArray(raw.albums))
+        ? raw.albums : {},
+      scannedAt: (typeof raw.scannedAt === 'string') ? raw.scannedAt : null
+    };
+  }
+
+  function poll() {
+    var settled = false;
+    var xhr = new XMLHttpRequest();
+    /* Same-origin relative URL. The bridge authenticates us with the cookie it
+       already set; XHR sends same-origin cookies by default. This page never
+       attaches a key, a token or an Authorization header, and never contacts
+       Home Assistant itself. */
+    var url = CONFIG.stateUrl + (CONFIG.stateUrl.indexOf('?') === -1 ? '?' : '&') +
+      '_=' + Date.now();
+
+    function fail(reason) {
+      if (settled) { return; }
+      settled = true;
+      onPollError(reason);
+    }
+
+    try {
+      xhr.open('GET', url, true);
+    } catch (e) {
+      fail('cannot open request');
+      return;
+    }
+    xhr.timeout = CONFIG.requestTimeoutMs;
+
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState !== 4 || settled) { return; }
+      settled = true;
+      if (xhr.status >= 200 && xhr.status < 300) {
+        var data = null;
+        try {
+          data = JSON.parse(xhr.responseText);
+        } catch (err) {
+          data = null;
+        }
+        if (data && typeof data === 'object' && !isArray(data)) {
+          onState(data);
+        } else {
+          onPollError('malformed JSON from bridge');
+        }
+      } else {
+        onPollError('HTTP ' + (xhr.status || 0));
+      }
+    };
+    xhr.ontimeout = function () { fail('timeout after ' + CONFIG.requestTimeoutMs + 'ms'); };
+    xhr.onerror = function () { fail('network error'); };
+
+    try {
+      xhr.send(null);
+    } catch (e2) {
+      fail('send failed');
+    }
+  }
+
+  function onState(raw) {
+    app.bridgeOk = true;
+    app.bridgeFailures = 0;
+    app.lastPollError = '';
+    app.lastStateAt = Date.now();
+    app.state = normalizeState(raw);
+    app.settingsSource = 'bridge';
+    app.bootstrapped = true;
+    cacheCurrentAlbum();
+    applySettings();
+  }
+
+  function onPollError(reason) {
+    app.bridgeFailures++;
+    app.lastPollError = reason;
+    if (app.bridgeFailures >= CONFIG.bridgeFailuresBeforeFallback) {
+      app.bridgeOk = false;
+      applySettings();
+    }
+    renderDiag();
+  }
+
+  /* =========================================================================
+     Offline album cache (paths only; never a credential — C4)
+     ========================================================================= */
+
+  function cacheCurrentAlbum() {
+    if (!CONFIG.features.cacheAlbums) { return; }
+    if (!app.albumName || !app.playlist.length) { return; }
+    try {
+      var payload = JSON.stringify({
+        album: app.albumName,
+        photos: app.playlist.slice(0, CONFIG.cacheMaxPhotos),
+        at: new Date().toISOString()
+      });
+      if (payload.length > CONFIG.cacheMaxChars) {
+        app.cacheNote = 'skipped (album too large to cache)';
+        return;
+      }
+      window.localStorage.setItem(CONFIG.cacheKey, payload);
+      app.cacheNote = 'saved ' + app.playlist.length + ' paths';
+    } catch (e) {
+      /* Storage disabled or full. The cache is an optimisation for bridge
+         outages only, so we record it for diagnostics and carry on. */
+      app.cacheNote = 'unavailable (' + (e && e.name ? e.name : 'error') + ')';
+    }
+  }
+
+  function cacheLoad() {
+    if (!CONFIG.features.cacheAlbums) { return null; }
+    var text = null;
+    try {
+      text = window.localStorage.getItem(CONFIG.cacheKey);
+    } catch (e) {
+      app.cacheNote = 'unreadable (' + (e && e.name ? e.name : 'error') + ')';
+      return null;
+    }
+    if (!text) { return null; }
+    var data = null;
+    try {
+      data = JSON.parse(text);
+    } catch (e2) {
+      return null;
+    }
+    if (!data || typeof data !== 'object' || !isArray(data.photos)) { return null; }
+    var photos = [];
+    var i;
+    for (i = 0; i < data.photos.length; i++) {
+      if (isSafeRelativePath(data.photos[i])) { photos.push(data.photos[i]); }
+    }
+    if (!photos.length) { return null; }
+    return {
+      album: (typeof data.album === 'string' && data.album) ? data.album : 'cached',
+      photos: photos,
+      at: (typeof data.at === 'string') ? data.at : ''
+    };
+  }
+
+  /* =========================================================================
+     Album resolution — all key lookups are own-property guarded (C2)
+     ========================================================================= */
+
+  function currentAlbumsMap() {
+    if (app.state && app.state.albums && ownKeys(app.state.albums).length) {
+      return app.state.albums;
+    }
+    if (app.cache) {
+      /* Null-prototype map so that a cached album called "__proto__" or
+         "constructor" cannot reach anything native. */
+      var map = Object.create(null);
+      map[app.cache.album] = app.cache.photos;
+      return map;
+    }
+    return Object.create(null);
+  }
+
+  function albumPhotos(albums, name) {
+    var out = [];
+    if (typeof name !== 'string' || !hasOwn(albums, name)) { return out; }
+    var list = albums[name];
+    if (!isArray(list)) { return out; }          /* "toString" would not be   */
+    var i;
+    for (i = 0; i < list.length; i++) {
+      if (isSafeRelativePath(list[i])) { out.push(list[i]); }
+    }
+    return out;
+  }
+
+  function resolveAlbum(albums, wanted) {
+    if (typeof wanted === 'string' && wanted &&
+        hasOwn(albums, wanted) && isArray(albums[wanted]) && albums[wanted].length) {
+      return wanted;
+    }
+    var fb = CONFIG.fallbackSchedule.album;
+    if (typeof fb === 'string' &&
+        hasOwn(albums, fb) && isArray(albums[fb]) && albums[fb].length) {
+      return fb;
+    }
+    var keys = ownKeys(albums);
+    var i;
+    for (i = 0; i < keys.length; i++) {
+      if (isArray(albums[keys[i]]) && albums[keys[i]].length) { return keys[i]; }
+    }
+    return null;
+  }
+
+  function ensurePlaylist(name, photos) {
+    var sig = String(name) + '|' + photos.length + '|' +
+      (photos.length ? photos[0] : '') + '|' +
+      (photos.length ? photos[photos.length - 1] : '');
+    if (sig === app.playlistSig) { return false; }
+
+    app.playlistSig = sig;
+    app.albumName = name || null;
+    app.playlist = photos.slice(0);
+    shuffle(app.playlist);                 /* shuffle within the album        */
+    app.playIndex = -1;
+    app.failStreak = 0;
+    releasePreload();
+    return true;
+  }
+
+  /* =========================================================================
+     Settings application
+     ========================================================================= */
+
+  function effectiveSettings() {
+    if (app.bridgeOk && app.state) {
+      return {
+        album: app.state.album,
+        display: app.state.display,
+        brightness: app.state.brightness,
+        interval: app.state.interval,
+        source: 'bridge'
+      };
+    }
+    var sch = scheduleNow(new Date());
+    var album = (app.state && app.state.album) ? app.state.album :
+      ((app.cache && app.cache.album) ? app.cache.album : CONFIG.fallbackSchedule.album);
+    return {
+      album: album,
+      display: sch.display,
+      brightness: sch.brightness,
+      interval: clamp(num(CONFIG.fallbackSchedule.intervalSec, CONFIG.defaultIntervalSec),
+                      CONFIG.minIntervalSec, CONFIG.maxIntervalSec),
+      source: 'fallback schedule (' + sch.label + ')'
+    };
+  }
+
+  function applySettings() {
+    var eff = effectiveSettings();
+    var albums = currentAlbumsMap();
+    var albumName = resolveAlbum(albums, eff.album);
+    var photos = albumName ? albumPhotos(albums, albumName) : [];
+    var playlistChanged = ensurePlaylist(albumName, photos);
+
+    app.settingsSource = eff.source;
+    app.brightness = eff.brightness;
+    applyDim(eff.display, eff.brightness);
+
+    var intervalChanged = (app.intervalSec !== eff.interval);
+    app.intervalSec = eff.interval;
+
+    if (!eff.display) {
+      if (app.displayOn) {
+        app.displayOn = false;
+        clearTimeout(app.photoTimer);
+        app.photoTimer = null;
+      }
+      /* Nothing is on screen: the safest moment to recycle the page. */
+      if (app.pendingReload) { window.location.reload(); return; }
+    } else {
+      if (!app.displayOn) {
+        app.displayOn = true;
+        scheduleNextPhoto(CONFIG.wakeDelayMs);
+      } else if (playlistChanged) {
+        scheduleNextPhoto(CONFIG.wakeDelayMs);
+      } else if (intervalChanged && app.photoTimer) {
+        scheduleNextPhoto(app.intervalSec * 1000);
+      } else if (!app.photoTimer && !app.loading) {
+        scheduleNextPhoto(CONFIG.wakeDelayMs);
+      }
+    }
+
+    if (!photos.length) {
+      showMessage(app.bridgeOk ?
+        'Waiting for photos…' :
+        'Bridge unreachable — waiting for photos…');
+    }
+
+    renderDiag();
+  }
+
+  /* =========================================================================
+     Slideshow
+     ========================================================================= */
+
+  function scheduleNextPhoto(ms) {
+    clearTimeout(app.photoTimer);
+    app.photoTimer = setTimeout(advance, ms);
+  }
+
+  function advance() {
+    app.photoTimer = null;
+
+    /* Recycle the page between photos rather than mid-crossfade. */
+    if (app.pendingReload) { window.location.reload(); return; }
+    if (!app.displayOn) { return; }
+
+    if (!app.playlist.length) {
+      showMessage(app.bridgeOk ?
+        'Waiting for photos…' :
+        'Bridge unreachable — waiting for photos…');
+      scheduleNextPhoto(10000);
+      return;
+    }
+
+    app.playIndex++;
+    if (app.playIndex >= app.playlist.length) {
+      shuffle(app.playlist);                 /* reshuffle on wrap             */
+      app.playIndex = 0;
+    }
+
+    var url = app.playlist[app.playIndex];
+    var token = ++app.loadToken;
+    var handle;
+
+    if (app.preload && app.preload.url === url) {
+      handle = app.preload;
+      app.preload = null;                    /* ownership moves to the layer  */
+    } else {
+      releasePreload();
+      handle = loadPhoto(url);
+    }
+
+    app.loading = true;
+    whenSettled(handle, function (h) {
+      if (token !== app.loadToken) {         /* superseded: drop the bitmap   */
+        releaseImg(h.img);
+        return;
+      }
+      app.loading = false;
+      if (h.state === 'ok') { onPhotoReady(h); }
+      else { onPhotoFailed(h); }
+    });
+  }
+
+  function onPhotoReady(handle) {
+    hideMessage();
+    app.failStreak = 0;
+    app.shownCount++;
+    app.currentUrl = handle.url;
+    showLayer(buildLayer(handle.img));
+    scheduleNextPhoto(app.intervalSec * 1000);
+    preloadNext();
+    renderDiag();
+  }
+
+  function onPhotoFailed(handle) {
+    releaseImg(handle.img);
+    app.failStreak++;
+    app.totalFailures++;
+
+    var limit = Math.min(app.playlist.length || 1, CONFIG.maxConsecutiveFailures);
+    if (app.failStreak >= limit) {
+      app.failStreak = 0;
+      showMessage('Photos are not loading — retrying…');
+      scheduleNextPhoto(CONFIG.errorRetryMs);
+    } else {
+      /* A broken photo is skipped fast; it must never stall the frame. */
+      scheduleNextPhoto(CONFIG.skipDelayMs);
+    }
+    renderDiag();
+  }
+
+  /* Exactly one image is preloaded ahead — no more, on a 1 GB device. */
+  function preloadNext() {
+    if (!app.playlist.length) { return; }
+    var next = app.playIndex + 1;
+    if (next >= app.playlist.length) { next = 0; }
+    var url = app.playlist[next];
+    if (!url) { return; }
+    if (app.preload && app.preload.url === url) { return; }
+    releasePreload();
+    app.preload = loadPhoto(url);
+  }
+
+  /* =========================================================================
+     Diagnostics panel (triple-tap)
+     C1: every value below is escaped, including album names, HA error strings,
+     route labels and counts.
+     ========================================================================= */
+
+  function diagOpen() {
+    return diagEl.className.indexOf('on') !== -1;
+  }
+
+  function setDiag(open) {
+    if (!CONFIG.features.diagnostics) { return; }
+    if (open) {
+      diagEl.className = 'on';
+      renderDiag();
+      clearInterval(app.diagTimer);
+      app.diagTimer = setInterval(renderDiag, CONFIG.diag.refreshMs);
+      clearTimeout(app.diagHideTimer);
+      app.diagHideTimer = setTimeout(function () { setDiag(false); },
+                                     CONFIG.diag.autoHideMs);
+    } else {
+      diagEl.className = '';
+      diagEl.innerHTML = '';
+      clearInterval(app.diagTimer);
+      app.diagTimer = null;
+      clearTimeout(app.diagHideTimer);
+    }
+  }
+
+  function diagRows() {
+    var s = app.state;
+    var now = Date.now();
+    var rows = [];
+
+    rows.push({ k: 'Uptime', v: fmtDuration(now - app.startedAt) });
+    rows.push({
+      k: 'Bridge',
+      v: app.bridgeOk ? 'reachable' : 'UNREACHABLE',
+      cls: app.bridgeOk ? 'ok' : 'bad'
+    });
+    rows.push({
+      k: 'Last state',
+      v: app.lastStateAt ? (fmtDuration(now - app.lastStateAt) + ' ago') : 'never'
+    });
+    rows.push({
+      k: 'Poll error',
+      v: app.lastPollError ? app.lastPollError : '—',
+      cls: app.lastPollError ? 'warn' : ''
+    });
+    rows.push({ k: 'Settings from', v: app.settingsSource });
+
+    rows.push({
+      k: 'Home Assistant',
+      v: s ? (s.haOk ? 'ok' : 'error') : 'unknown',
+      cls: s ? (s.haOk ? 'ok' : 'bad') : 'warn'
+    });
+    rows.push({ k: 'HA route', v: (s && s.haVia) ? s.haVia : '—' });
+    rows.push({
+      k: 'HA error',
+      v: (s && s.haError) ? trunc(s.haError, CONFIG.diag.maxValueChars) : '—',
+      cls: (s && s.haError) ? 'bad' : ''
+    });
+    rows.push({ k: 'HA last ok', v: (s && s.haLastOk) ? s.haLastOk : '—' });
+
+    rows.push({
+      k: 'Album',
+      v: app.albumName ? trunc(app.albumName, CONFIG.diag.maxValueChars) : '(none)'
+    });
+    rows.push({
+      k: 'Photos',
+      v: app.playlist.length + ' in album · showing ' +
+         (app.playlist.length ? (app.playIndex + 1) : 0)
+    });
+    rows.push({
+      k: 'Current file',
+      v: app.currentUrl ? trunc(app.currentUrl, CONFIG.diag.maxValueChars) : '—'
+    });
+
+    var albumNames = ownKeys(currentAlbumsMap());
+    rows.push({
+      k: 'Albums seen',
+      v: albumNames.length + (albumNames.length ?
+          (' · ' + trunc(albumNames.join(', '), CONFIG.diag.maxValueChars)) : '')
+    });
+
+    rows.push({
+      k: 'Display',
+      v: app.displayOn ? 'on' : 'off (black)',
+      cls: app.displayOn ? 'ok' : 'warn'
+    });
+    rows.push({ k: 'Brightness', v: app.brightness + '%' });
+    rows.push({ k: 'Interval', v: app.intervalSec + 's' });
+    rows.push({ k: 'Photos shown', v: app.shownCount });
+    rows.push({
+      k: 'Load failures',
+      v: app.totalFailures + ' total · ' + app.failStreak + ' in a row',
+      cls: app.failStreak ? 'warn' : ''
+    });
+    rows.push({ k: 'Scanned at', v: (s && s.scannedAt) ? s.scannedAt : '—' });
+    rows.push({ k: 'Offline cache', v: app.cacheNote });
+    rows.push({
+      k: 'Next reload in',
+      v: fmtDuration(CONFIG.reloadEveryMs - (now - app.startedAt))
+    });
+    rows.push({
+      k: 'Viewport',
+      v: window.innerWidth + '×' + window.innerHeight + ' @' +
+         (window.devicePixelRatio || 1) + 'x'
+    });
+    rows.push({
+      k: 'Script error',
+      v: app.lastScriptError ? trunc(app.lastScriptError, CONFIG.diag.maxValueChars) : '—',
+      cls: app.lastScriptError ? 'bad' : ''
+    });
+
+    return rows;
+  }
+
+  function renderDiag() {
+    if (!CONFIG.features.diagnostics || !diagOpen()) { return; }
+    var rows = diagRows();
+    var html = '<div class="d-title">Photo Frame diagnostics</div>';
+    var i, cls;
+    for (i = 0; i < rows.length; i++) {
+      cls = rows[i].cls ? (' ' + rows[i].cls) : '';
+      html += '<div class="d-row">' +
+        '<span class="d-k">' + esc(rows[i].k) + '</span>' +
+        '<span class="d-v' + esc(cls) + '">' + esc(rows[i].v) + '</span>' +
+        '</div>';
+    }
+    html += '<div class="d-foot">tap anywhere to close</div>';
+    diagEl.innerHTML = html;
+  }
+
+  /* =========================================================================
+     Input: triple-tap toggle, no scrolling, no zoom
+     ========================================================================= */
+
+  var tapCount = 0;
+  var lastTapAt = 0;
+
+  function onTap() {
+    var now = Date.now();
+    /* Swallow the synthetic click Safari fires ~300ms after touchend. */
+    if (now - lastTapAt < 80) { return; }
+
+    if (diagOpen()) {
+      setDiag(false);
+      tapCount = 0;
+      lastTapAt = now;
+      return;
+    }
+
+    if (now - lastTapAt > CONFIG.diag.tapWindowMs) { tapCount = 0; }
+    tapCount++;
+    lastTapAt = now;
+
+    if (tapCount >= CONFIG.diag.tapsToOpen) {
+      tapCount = 0;
+      setDiag(true);
+    }
+  }
+
+  function bindInput() {
+    document.addEventListener('touchend', onTap, false);
+    document.addEventListener('click', onTap, false);
+
+    /* Suppress rubber-band scrolling and pinch zoom in standalone mode. */
+    document.addEventListener('touchmove', function (e) {
+      if (e.preventDefault) { e.preventDefault(); }
+    }, false);
+    document.addEventListener('gesturestart', function (e) {
+      if (e.preventDefault) { e.preventDefault(); }
+    }, false);
+    document.addEventListener('contextmenu', function (e) {
+      if (e.preventDefault) { e.preventDefault(); }
+    }, false);
+  }
+
+  /* =========================================================================
+     Housekeeping tick: clock, schedule re-evaluation, scheduled reload
+     ========================================================================= */
+
+  function tick() {
+    updateClock();
+
+    if (!app.pendingReload && (Date.now() - app.startedAt) >= CONFIG.reloadEveryMs) {
+      /* Recycle the page to keep memory flat. The reload happens at the next
+         photo boundary (or immediately if the display is already black). */
+      app.pendingReload = true;
+      if (!app.displayOn) { window.location.reload(); return; }
+    }
+
+    /* The fallback schedule changes with the wall clock, so re-apply. */
+    if (!app.bridgeOk) { applySettings(); }
+    renderDiag();
+  }
+
+  function onVisible() {
+    if (document.hidden === true) { return; }
+    poll();
+    if (app.displayOn && !app.photoTimer && !app.loading) {
+      scheduleNextPhoto(CONFIG.wakeDelayMs);
+    }
+  }
+
+  /* =========================================================================
+     Boot
+     ========================================================================= */
+
+  function bootstrapFromCacheIfNeeded() {
+    if (app.bootstrapped) { return; }
+    var cached = cacheLoad();
+    if (!cached) { return; }
+    app.cache = cached;
+    app.cacheNote = 'restored ' + cached.photos.length + ' paths' +
+      (cached.at ? (' from ' + cached.at) : '');
+    applySettings();
+  }
+
+  function init() {
+    dimEl.style.webkitTransitionDuration = CONFIG.dimFadeMs + 'ms';
+    dimEl.style.transitionDuration = CONFIG.dimFadeMs + 'ms';
+
+    window.onerror = function (message, source, line) {
+      app.lastScriptError = String(message) + ' @' + String(line);
+      return false;
+    };
+
+    bindInput();
+    updateClock();
+    showMessage('Starting…');
+
+    /* First paint decision comes from the schedule; the bridge overrides it as
+       soon as it answers. */
+    applySettings();
+
+    poll();
+    app.pollTimer = setInterval(poll, CONFIG.pollIntervalMs);
+    app.tickTimer = setInterval(tick, CONFIG.scheduleTickMs);
+    setInterval(updateClock, 5000);
+
+    /* If the bridge has not answered shortly after boot, fall back to the
+       cached playlist so an outage never leaves a black rectangle. */
+    setTimeout(bootstrapFromCacheIfNeeded, CONFIG.cacheBootstrapDelayMs);
+
+    if ('hidden' in document) {
+      document.addEventListener('visibilitychange', onVisible, false);
+    }
+    window.addEventListener('pageshow', onVisible, false);
+  }
+
+  init();
+}());
+</script>
+</body>
+</html>
