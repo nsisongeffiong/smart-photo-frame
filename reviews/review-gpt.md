@@ -1,335 +1,256 @@
 ## Documentation Gaps
 
-No material docstring gaps were found among the exported functions and classes in `server.js`. `loadConfig`, `AuthGate`, `HomeAssistantClient`, `PhotoLibrary`, `createPhotoHandler`, and `createApp` all document parameters and return values adequately.
-
-`scripts/run.py` and `src/index.js` expose no public functions or classes.
+No material docstring gaps were found in the public API. The exported `loadConfig`, `AuthGate`, `HomeAssistantClient`, `PhotoLibrary`, `createPhotoHandler`, and `createApp` APIs have adequate JSDoc.
 
 ## Code Quality Issues
 
 ### Correctness
 
-- [server.js:583-633] `HomeAssistantClient.poll()` treats a route as healthy when every entity request returns an unusable HTTP response, such as four `401` responses. It sets `haOk = true`, updates `haLastOk`, and may switch the active route despite receiving no valid state. Suggested fix: distinguish route reachability from successful state retrieval; only update `haOk` and `haLastOk` when at least one entity state is successfully parsed.
+- [public/index.html:779-788] `onState()` calls `cacheCurrentAlbum()` before `applySettings()`. On the first successful poll nothing is cached; after an album change, the previous album is cached until the next poll. Suggested fix: apply the new state first, then cache the resolved playlist.
 
-- [server.js:615-629] Partial transport failures are discarded whenever another entity request succeeds. `haError` therefore reports no problem if one request succeeds and three time out. Suggested fix: add transport failures to `problems`, including the affected entity ID.
+- [public/index.html:906-914] `resolveAlbum()` considers an album usable based on the raw array length, before unsafe paths are filtered. An album containing only invalid paths is selected instead of falling back to another valid album. Suggested fix: select albums based on `albumPhotos(albums, name).length`.
 
-- [server.js:687-697] `Number.parseFloat()` accepts malformed states such as `"50abc"` and `"15 seconds"`, causing invalid HA data to overwrite last-known-good values. Suggested fix: trim the entire value and parse it with `Number()`, rejecting empty or non-finite values.
+- [public/index.html:917-932] The playlist signature only includes the album name, count, first path, and last path. Changes to middle entries are ignored, leaving the slideshow permanently stale when the count and endpoints remain unchanged. Suggested fix: compute the signature from every validated path.
 
-- [server.js:783-806] The per-album cap is applied before sorting, so the selected photos depend on filesystem enumeration order. Albums exceeding the cap can expose a different subset after rescans or filesystem changes. Suggested fix: collect valid names, sort deterministically, then slice to the configured limit.
+- [public/index.html:971-985,1026-1056] A playlist change schedules another `advance()` even when an old image load is still running. Both loads can complete, briefly display a photo from the previous album, and violate the stated low-memory loading constraint. There is no retained handle for cancelling or invalidating the active load when settings change. Suggested fix: track the active load, invalidate it when the playlist/display state changes, and only start a replacement after the stale callback has released its image.
 
-- [server.js:962-971] The error handler returns `"Internal Server Error"` for non-400 client errors while preserving their 4xx status. A `404` from `sendFile`, for example, gets a misleading body. Suggested fix: map common 4xx statuses to an appropriate generic body and reserve `"Internal Server Error"` for 5xx responses.
+- [public/index.html:1166-1193] The synthetic-click suppression does not match its comment. Safari’s compatibility click typically arrives hundreds of milliseconds after `touchend`, so the 80 ms check can count one physical tap twice and open diagnostics after fewer than three taps. Suggested fix: pass the event to the handler and suppress `click` events for a short period after a touch event.
 
-- [scripts/run.py:39] Launching a missing or non-executable shared virtual-environment Python raises an uncaught `OSError` and prints a traceback. Suggested fix: validate `VENV_PYTHON` before launching or catch `OSError` and emit the same concise configuration error style used for a missing orchestrator.
+- [server.js:760-784] Album selection at the 512-album cap depends on filesystem `readdir()` order. Large libraries can expose a different set of albums after rescans. Suggested fix: filter and sort candidate album entries before applying the cap.
 
-### Security and resilience
+- [server.js:805-831] `HARD_ALBUM_SCAN_LIMIT` is applied before sorting. A directory exceeding 200,000 valid images still gets a nondeterministic subset, despite the surrounding determinism guarantees. Suggested fix: use a bounded ordered selection structure or explicitly reject/skip over-limit albums rather than selecting based on enumeration order.
 
-- [server.js:238-244] `TRUST_PROXY` defaults to `1`. If the service is ever exposed directly rather than through exactly one proxy, clients can influence `req.ip` through `X-Forwarded-For` and bypass per-IP throttling. Suggested fix: default to `false` and require deployments behind a proxy to configure `TRUST_PROXY` explicitly.
+- [server.js:1054-1067] `main()` does not handle the HTTP server’s asynchronous `error` event. An occupied port or permission failure produces an uncaught emitter error rather than the structured fatal log path. Suggested fix: attach an `error` listener and await either `listening` or `error`.
 
-- [server.js:643-662] The 1 MiB HA response limit only checks `Content-Length`. A chunked response or a response without that header is read without a bound by `response.json()`, allowing a faulty or compromised endpoint to consume excessive memory. Suggested fix: stream and count response bytes before parsing JSON.
-
-- [server.js:602] The JSDoc type references `this.entities`, which does not exist; the actual field is `#entities`. This will fail or degrade `checkJs` type analysis. Suggested fix: define an explicit entity-role typedef instead of referencing an inaccessible/nonexistent property.
+- [scripts/run.py:38] Starting a missing or non-executable `VENV_PYTHON` raises an uncaught `OSError`, producing a traceback instead of the runner’s concise configuration error. Suggested fix: validate the executable or catch `OSError` around `subprocess.run()`.
 
 ### Maintainability
 
-- [package.json:11-13] There is no test script or lint/type-check script, despite substantial security-sensitive logic. Suggested fix: add at least `node --test`, plus ESLint or `tsc --checkJs` validation.
-
-- [src/index.js:1-2] This generated placeholder is unused because `package.json` points to `server.js`. Suggested fix: remove it or make it the real entry point; retaining an inert entry point creates ambiguity.
+- [src/index.js:1-2] This generated placeholder is an unused competing entry point; `package.json` correctly points to `server.js`. Suggested fix: remove `src/index.js`.
 
 ## Test Coverage
 
-No tests are present, and `package.json` provides no test command. The following paths need coverage.
+### Browser client
 
-### Configuration
+`public/index.html` currently has no automated coverage. Add tests using a Safari-12-compatible DOM/XHR harness for:
 
-- Missing each required variable and multiple variables together.
-- Weak, short, non-ASCII, whitespace-containing, repetitive, and oversized `FRAME_KEY` values.
-- Valid and invalid integer forms, including bounds, leading zeroes, decimals, signs, and empty values.
-- HA URLs with unsupported schemes, embedded credentials, trailing slashes, paths, queries, and fragments.
-- Duplicate primary/fallback URLs.
-- Invalid entity IDs.
-- Every supported `TRUST_PROXY` form and the secure default.
+- First successful bridge response caches the newly resolved album immediately.
+- Switching albums during an in-flight image load never displays the old album’s image.
+- Turning the display off during a load releases the completed stale image and does not schedule another photo.
+- An album containing only unsafe paths falls back to an album containing valid paths.
+- A middle-only playlist change is detected when album name, length, first item, and last item remain unchanged.
+- Exactly three physical touch taps open diagnostics; compatibility click events do not increment the count.
+- Schedule selection before the first entry wraps to the prior day’s last entry.
+- Malformed cached JSON, invalid paths, unavailable local storage, and storage quota failures degrade safely.
+- Failed preloads, image timeouts, consecutive-failure backoff, and playlist wrap reshuffling.
+- Layer cleanup under rapid successive transitions never leaves more than two layers.
 
-### Authentication
+### Server
 
-- Valid `?k=` sets the cookie and redirects without retaining any query string secret.
-- Valid cookie authenticates without incrementing failure counters.
-- Malformed and oversized Cookie headers return `401`, not `500`.
-- Duplicate cookie names use the documented first value.
-- Failure count reaches the threshold exactly, then returns `429`.
-- Expired buckets are reset and removed by `sweep()`.
-- Bucket-cap eviction does not grow beyond 10,000 entries.
-- `/healthz` remains open, including with a malformed or invalid key.
-- Direct requests with spoofed `X-Forwarded-For` cannot evade throttling under the default configuration.
-- Non-GET/HEAD methods return `405` before authentication.
+Existing smoke tests do not exercise most network-facing behavior. Add cases for:
 
-### Home Assistant polling
-
-- All four requests succeed.
-- Primary transport failure causes fallback use.
-- Primary recovery is detected on the configured reprobe cycle.
-- All requests time out while last-known-good values remain intact.
-- One request succeeds while the others time out; degraded status is reported.
-- All requests return `401`, `404`, malformed JSON, missing state fields, and oversized bodies.
-- Chunked bodies larger than the response limit are rejected.
-- Redirect responses never forward the bearer token.
-- Invalid numeric states such as `"50abc"`, whitespace-only strings, `NaN`, and infinity preserve previous values.
-- Brightness and interval values are rounded and clamped correctly.
-- Invalid and unavailable album names preserve the previous album.
-- `haLastOk` changes only after usable state data is received.
-
-### Photo library and serving
-
-- Missing or unreadable photo root retains the prior catalogue.
-- Hidden albums, symlinked albums, invalid names, and non-directories are skipped.
-- Hidden files, unsupported extensions, control characters, nested paths, and symlinks are skipped.
-- Case-insensitive supported extensions are accepted.
-- Natural sorting is deterministic.
-- Album and photo caps select a deterministic sorted subset.
-- One unreadable album does not abort other album scans.
-- Encoded traversal attempts, encoded slashes, extra path segments, and backslashes return `404`.
-- Symlinks resolving outside the photo root are rejected.
-- A file disappearing between `realpath` and `sendFile` returns a correct 4xx response without exposing internal paths.
-- Authenticated `HEAD` requests work for photos and static files.
-
-### HTTP application and lifecycle
-
-- Security headers appear on success, authentication failures, health checks, and error responses.
-- `/healthz` returns `503` only when the library is unhealthy.
-- `/api/state` includes `Vary: Cookie` and `Cache-Control: no-store`.
-- Missing static files return `404`.
-- Startup with an occupied port is handled predictably.
-- Repeated or closely spaced shutdown signals do not execute shutdown twice.
-- Scheduled tasks never overlap and stop scheduling after their stop function is called.
+- All HA entities succeed and update the snapshot.
+- Four `401` responses leave `haOk` false and do not advance `haLastOk`.
+- One entity succeeds while three time out; last-known-good values and degradation details are correct.
+- Primary failure, fallback activation, and scheduled primary reprobe.
+- Oversized chunked bodies and oversized declared bodies are rejected.
+- Redirect responses do not forward the bearer token.
+- Strict numeric parsing for whitespace, `NaN`, infinity, and values such as `50abc`.
+- `/healthz` returns `200` and `503` in the appropriate library states.
+- Authentication, security headers, `HEAD`, `405`, static `404`, and `/api/state` cache headers through a real HTTP server.
+- Photo traversal, encoded separators, extra segments, disappearing files, and symlinks escaping the root.
+- More than 512 albums and more than 200,000 files produce deterministic behavior.
+- An occupied port is reported through the intended fatal-error path.
+- Expired auth buckets, valid-cookie bypass, duplicate cookies, and bucket-cap eviction.
+- Repeated shutdown signals remain idempotent.
 
 ### Pipeline runner
 
+Add Python subprocess tests for:
+
+- Missing and non-executable virtual-environment interpreter.
 - Missing orchestrator.
-- Missing virtual-environment interpreter.
-- Brand directory absent, non-empty, and empty with successful/failed submodule initialization.
-- Orchestrator exit status is propagated.
+- Brand directory absent, populated, and empty.
+- Failed `git submodule update` continues with a warning.
+- Orchestrator exit status is propagated unchanged.
 
 ## Suggested Improvements
 
-### 1. Separate HA reachability from usable polling results
+### 1. Resolve and cache the new playlist in the correct order
 
 Before:
 
 ```js
-if (outcome.reachable) {
-  this.#haOk = true;
-  this.#lastOkAt = Date.now();
-  this.#haError = outcome.problems.length > 0
-    ? outcome.problems.join('; ')
-    : null;
-  this.#applyValues(outcome.values);
-  return;
+function onState(raw) {
+  app.bridgeOk = true;
+  app.bridgeFailures = 0;
+  app.lastPollError = '';
+  app.lastStateAt = Date.now();
+  app.state = normalizeState(raw);
+  app.settingsSource = 'bridge';
+  app.bootstrapped = true;
+  cacheCurrentAlbum();
+  applySettings();
 }
 ```
 
 After:
 
 ```js
-if (outcome.reachable) {
-  if (index !== this.#activeIndex) {
-    log('info', 'ha route changed', {
-      from: this.#routes[this.#activeIndex].name,
-      to: route.name
-    });
-    this.#activeIndex = index;
-  }
+function onState(raw) {
+  app.bridgeOk = true;
+  app.bridgeFailures = 0;
+  app.lastPollError = '';
+  app.lastStateAt = Date.now();
+  app.state = normalizeState(raw);
+  app.settingsSource = 'bridge';
+  app.bootstrapped = true;
 
-  const usable = Object.keys(outcome.values).length > 0;
-  this.#haOk = usable;
-  this.#haError = outcome.problems.length > 0
-    ? outcome.problems.join('; ')
-    : usable
-      ? null
-      : 'no usable entity states';
-
-  if (usable) {
-    this.#lastOkAt = Date.now();
-    this.#applyValues(outcome.values);
-  }
-  return;
+  applySettings();
+  cacheCurrentAlbum();
 }
 ```
 
-Record transport failures per entity:
+### 2. Validate album contents while resolving the album
+
+Before:
 
 ```js
-settled.forEach((result, index) => {
-  const key = keys[index];
-
-  if (result.status === 'fulfilled') {
-    reachable = true;
-    values[key] = result.value;
-    return;
+function resolveAlbum(albums, wanted) {
+  if (typeof wanted === 'string' && wanted &&
+      hasOwn(albums, wanted) && isArray(albums[wanted]) && albums[wanted].length) {
+    return wanted;
   }
 
-  const error = result.reason;
-  if (error && typeof error === 'object' && error.reachable === true) {
-    reachable = true;
+  // Other candidates use the same raw-array check.
+}
+```
+
+After:
+
+```js
+function hasUsablePhotos(albums, name) {
+  return typeof name === 'string' &&
+    hasOwn(albums, name) &&
+    albumPhotos(albums, name).length > 0;
+}
+
+function resolveAlbum(albums, wanted) {
+  if (hasUsablePhotos(albums, wanted)) {
+    return wanted;
   }
 
-  problems.push(`${this.#entities[key]}: ${describeError(error)}`);
+  var fallback = CONFIG.fallbackSchedule.album;
+  if (hasUsablePhotos(albums, fallback)) {
+    return fallback;
+  }
+
+  var keys = ownKeys(albums);
+  var i;
+  for (i = 0; i < keys.length; i++) {
+    if (hasUsablePhotos(albums, keys[i])) {
+      return keys[i];
+    }
+  }
+  return null;
+}
+```
+
+### 3. Detect all playlist changes
+
+Before:
+
+```js
+var sig = String(name) + '|' + photos.length + '|' +
+  (photos.length ? photos[0] : '') + '|' +
+  (photos.length ? photos[photos.length - 1] : '');
+```
+
+After:
+
+```js
+function playlistSignature(name, photos) {
+  var parts = [String(name), String(photos.length)];
+  var i;
+
+  for (i = 0; i < photos.length; i++) {
+    parts.push(String(photos[i].length));
+    parts.push(photos[i]);
+  }
+  return parts.join('|');
+}
+
+function ensurePlaylist(name, photos) {
+  var sig = playlistSignature(name, photos);
+  if (sig === app.playlistSig) { return false; }
+
+  app.playlistSig = sig;
+  app.albumName = name || null;
+  app.playlist = photos.slice(0);
+  shuffle(app.playlist);
+  app.playIndex = -1;
+  app.failStreak = 0;
+  releasePreload();
+  return true;
+}
+```
+
+Length-prefixing avoids ambiguous signatures such as `["a|b", "c"]` versus `["a", "b|c"]`.
+
+### 4. Report server startup failures predictably
+
+Before:
+
+```js
+const server = app.listen(config.port, () => {
+  log('info', 'listening', { port: config.port });
 });
 ```
 
-### 2. Parse numeric HA states strictly
+After:
+
+```js
+const server = await new Promise((resolve, reject) => {
+  const candidate = app.listen(config.port);
+
+  candidate.once('listening', () => resolve(candidate));
+  candidate.once('error', reject);
+});
+
+log('info', 'listening', {
+  port: config.port,
+  photosDir: photosRoot,
+  trustProxy: String(config.trustProxy)
+});
+```
+
+This allows the existing `main().catch(...)` path to log `EADDRINUSE` and exit cleanly.
+
+### 5. Handle pipeline launch failures without a traceback
 
 Before:
 
-```js
-const brightness = Number.parseFloat(values.brightness);
-if (Number.isFinite(brightness)) {
-  this.#values.brightness = clamp(Math.round(brightness), 10, 100);
-}
+```python
+result = subprocess.run(
+    [str(VENV_PYTHON), str(ORCHESTRATOR)] + sys.argv[1:],
+    env=env,
+    cwd=str(PROJECT_ROOT),
+)
+sys.exit(result.returncode)
 ```
 
 After:
 
-```js
-function parseFiniteState(value) {
-  if (typeof value !== 'string') return null;
+```python
+try:
+    result = subprocess.run(
+        [str(VENV_PYTHON), str(ORCHESTRATOR), *sys.argv[1:]],
+        env=env,
+        cwd=str(PROJECT_ROOT),
+    )
+except OSError as exc:
+    print(f"ERROR: Unable to launch shared Python at {VENV_PYTHON}: {exc}")
+    sys.exit(1)
 
-  const text = value.trim();
-  if (text === '') return null;
-
-  const number = Number(text);
-  return Number.isFinite(number) ? number : null;
-}
-
-const brightness = parseFiniteState(values.brightness);
-if (brightness !== null) {
-  this.#values.brightness = clamp(Math.round(brightness), 10, 100);
-}
-
-const interval = parseFiniteState(values.interval);
-if (interval !== null) {
-  this.#values.interval = clamp(Math.round(interval), 1, 3600);
-}
+sys.exit(result.returncode)
 ```
-
-### 3. Enforce the HA body limit while reading
-
-Before:
-
-```js
-const declaredLength = Number.parseInt(
-  response.headers.get('content-length') ?? '',
-  10
-);
-
-if (Number.isFinite(declaredLength) && declaredLength > 1_048_576) {
-  throw new HaResponseError('response too large');
-}
-
-const body = await response.json();
-```
-
-After:
-
-```js
-async function readJsonLimited(response, maxBytes) {
-  if (!response.body) {
-    throw new HaResponseError('missing response body');
-  }
-
-  const reader = response.body.getReader();
-  const chunks = [];
-  let total = 0;
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-
-    total += value.byteLength;
-    if (total > maxBytes) {
-      await reader.cancel();
-      throw new HaResponseError('response too large');
-    }
-    chunks.push(value);
-  }
-
-  const bytes = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
-  try {
-    return JSON.parse(bytes.toString('utf8'));
-  } catch {
-    throw new HaResponseError('malformed JSON');
-  }
-}
-
-const body = await readJsonLimited(response, 1_048_576);
-```
-
-The `Content-Length` check can remain as an early rejection, but it must not be the only enforcement.
-
-### 4. Make photo-cap selection deterministic
-
-Before:
-
-```js
-for (const entry of entries) {
-  if (names.length >= this.#maxPerAlbum) {
-    capped = true;
-    break;
-  }
-
-  if (!isValidPhotoName(entry.name)) continue;
-  names.push(entry.name);
-}
-
-names.sort(compareNames);
-```
-
-After:
-
-```js
-for (const entry of entries) {
-  if (entry.name.startsWith('.')) continue;
-  if (entry.isSymbolicLink() || !entry.isFile()) continue;
-  if (!isValidPhotoName(entry.name)) continue;
-  if (!isInside(this.#root, path.join(dir, entry.name))) continue;
-
-  names.push(entry.name);
-}
-
-names.sort((a, b) =>
-  a.localeCompare(b, 'en', { numeric: true, sensitivity: 'base' })
-);
-
-const capped = names.length > this.#maxPerAlbum;
-const selected = names.slice(0, this.#maxPerAlbum);
-
-if (capped) {
-  log('warn', 'album photo cap reached', {
-    album,
-    max: this.#maxPerAlbum
-  });
-}
-
-return selected.map(
-  (name) => `photos/${encodeURIComponent(album)}/${encodeURIComponent(name)}`
-);
-```
-
-### 5. Default proxy trust to a safe value
-
-Before:
-
-```js
-if (raw === undefined || String(raw).trim() === '') return 1;
-```
-
-After:
-
-```js
-if (raw === undefined || String(raw).trim() === '') return false;
-```
-
-Then configure the intended deployment explicitly:
-
-```env
-TRUST_PROXY=1
-```
-
-This prevents an accidental direct deployment from making `X-Forwarded-For` part of the authentication throttling trust boundary.
