@@ -243,6 +243,27 @@ function readInt(env, name, fallback, bounds = {}) {
 }
 
 /**
+ * Read a boolean environment variable.
+ *
+ * Strict on purpose, like readInt: an unrecognised value is a boot failure, not
+ * a silent fall back to the default. These flags select a security posture, and
+ * "ture" or "yes" must never quietly pick the opposite of what was intended.
+ *
+ * @param {NodeJS.ProcessEnv} env Environment.
+ * @param {string} name Variable name.
+ * @param {boolean} fallback Default when unset or empty.
+ * @returns {boolean} Parsed value.
+ */
+function readBool(env, name, fallback) {
+  const raw = env[name];
+  if (raw === undefined || String(raw).trim() === '') return fallback;
+  const text = String(raw).trim().toLowerCase();
+  if (text === 'true' || text === '1') return true;
+  if (text === 'false' || text === '0') return false;
+  throw new ConfigError(`${name} must be true or false (or 1/0), got ${JSON.stringify(String(raw).trim())}`);
+}
+
+/**
  * Validate a Home Assistant base URL before the bearer token is ever sent to it (S9).
  *
  * @param {string} name Variable name, for error messages.
@@ -368,6 +389,7 @@ function readEntityId(env, name, fallback) {
  * @property {number} maxPhotosPerAlbum
  * @property {number} authMaxFails
  * @property {number} authWindowMs
+ * @property {boolean} allowQueryKey
  * @property {number|boolean|string} trustProxy
  * @property {EntityMap} entities
  */
@@ -415,6 +437,22 @@ export function loadConfig(env = process.env) {
     maxPhotosPerAlbum: readInt(env, 'MAX_PHOTOS_PER_ALBUM', 5_000, { min: 1, max: 200_000 }),
     authMaxFails: readInt(env, 'AUTH_MAX_FAILS', 10, { min: 1, max: 1_000 }),
     authWindowMs: readInt(env, 'AUTH_WINDOW_MS', 900_000, { min: 1_000, max: 86_400_000 }),
+    // Opt-in, default false. Off, a valid ?k= is accepted once and then 303'd to
+    // the bare path, so the secret exists in a URL for exactly one request.
+    //
+    // On, a valid ?k= still sets the cookie but the request is served directly.
+    // This exists for an iOS home-screen web app: it keeps a cookie store of its
+    // own, separate from Safari's, so a cookie set during a Safari session can
+    // never reach it — and after the 303 it would land on a bare path holding no
+    // cookie at all. Its icon URL must therefore carry the key on every launch,
+    // which means the key must not be stripped.
+    //
+    // The tradeoff, accepted deliberately when this is enabled: the key is
+    // persisted in the icon URL on the device and shows up in the access log of
+    // every proxy in front of this service. Referrer-Policy: no-referrer, set on
+    // every response, already stops it leaking cross-origin via Referer. Leave
+    // this false unless the home-screen web app is actually in use.
+    allowQueryKey: readBool(env, 'ALLOW_QUERY_KEY', false),
     trustProxy: readTrustProxy(env),
     entities: {
       album: readEntityId(env, 'ENTITY_ALBUM', 'input_select.photo_frame_album'),
@@ -440,6 +478,7 @@ export class AuthGate {
   #frameKey;
   #maxFails;
   #windowMs;
+  #allowQueryKey;
   #openPaths;
   /** @type {Map<string, { fails: number, expiresAt: number }>} */
   #buckets = new Map();
@@ -451,13 +490,16 @@ export class AuthGate {
    * @param {string} options.frameKey Shared secret accepted as ?k=.
    * @param {number} options.maxFails Failures allowed per window before throttling.
    * @param {number} options.windowMs Failure window in milliseconds.
+   * @param {boolean} [options.allowQueryKey] Serve ?k= requests directly instead
+   *   of redirecting to the bare path (ALLOW_QUERY_KEY; see loadConfig).
    * @param {string[]} [options.openPaths] Paths served without authentication.
    */
-  constructor({ sessionToken, frameKey, maxFails, windowMs, openPaths = [] }) {
+  constructor({ sessionToken, frameKey, maxFails, windowMs, allowQueryKey = false, openPaths = [] }) {
     this.#sessionToken = sessionToken;
     this.#frameKey = frameKey;
     this.#maxFails = maxFails;
     this.#windowMs = windowMs;
+    this.#allowQueryKey = allowQueryKey;
     this.#openPaths = new Set(openPaths);
   }
 
@@ -472,15 +514,17 @@ export class AuthGate {
     // 1. Already authenticated? Never throttled, never rate-limit accounted (S3).
     const cookies = parseCookies(req.headers.cookie);
     if (safeEqual(cookies[COOKIE_NAME], this.#sessionToken)) {
-      if (typeof req.query.k === 'string') {
-        // Still strip a secret that ended up in the URL bar.
+      if (typeof req.query.k === 'string' && !this.#allowQueryKey) {
+        // Still strip a secret that ended up in the URL bar. Under
+        // ALLOW_QUERY_KEY the key is expected on every request, so stripping it
+        // would just add a redirect hop to every navigation.
         return this.#redirectBare(req, res);
       }
       return next();
     }
 
-    // 2. A key in the query string: accept once, then get it out of history,
-    //    Referer headers and proxy access logs (S1).
+    // 2. A key in the query string: accept once, then (unless ALLOW_QUERY_KEY is
+    //    set) get it out of history, Referer headers and proxy access logs (S1).
     const provided = typeof req.query.k === 'string' ? req.query.k : null;
     const ip = this.#clientIp(req);
 
@@ -489,6 +533,11 @@ export class AuthGate {
       if (safeEqual(provided, this.#frameKey)) {
         this.#buckets.delete(ip);
         this.#issueCookie(res);
+        // The cookie is still issued either way: a client that can hold it stops
+        // depending on the key. The iOS home-screen web app cannot, so under
+        // ALLOW_QUERY_KEY the request is served here rather than redirected —
+        // the redirect target would carry no key and no cookie.
+        if (this.#allowQueryKey) return next();
         return this.#redirectBare(req, res);
       }
       this.#recordFailure(ip);
@@ -1408,6 +1457,7 @@ async function main() {
     frameKey: config.frameKey,
     maxFails: config.authMaxFails,
     windowMs: config.authWindowMs,
+    allowQueryKey: config.allowQueryKey,
     openPaths: ['/healthz']
   });
 
@@ -1428,7 +1478,10 @@ async function main() {
       // Logged explicitly: if this is false behind a proxy, every client shares
       // one throttle bucket, and if it is truthy without a proxy, throttling can
       // be evaded. Operators need to see the effective value.
-      trustProxy: String(config.trustProxy)
+      trustProxy: String(config.trustProxy),
+      // Also logged explicitly: when true the frame key is expected to live in
+      // the URL of every request, and it will be visible in proxy access logs.
+      allowQueryKey: config.allowQueryKey
     });
   });
 

@@ -27,6 +27,9 @@
 #  * public/index.html has a header comment listing forbidden syntax. HTML,
 #    block and line comments are stripped before scanning for ?. and ?? —
 #    the comment is documentation, not a defect.
+#  * Assertions that grep a response never pipe into grep -q; see the comment on
+#    check_matches. pipefail plus an early-exiting grep turns a match into a
+#    failure whenever the haystack is big enough to lose the SIGPIPE race.
 
 set -uo pipefail
 
@@ -103,6 +106,7 @@ PHOTOS="$TMP/photos"
 JAR_MAIN="$TMP/jar-main"
 JAR_RL="$TMP/jar-rl"
 JAR_FO="$TMP/jar-fo"
+JAR_QK="$TMP/jar-qk"
 
 # ---------------------------------------------------------------------------
 # Node helpers
@@ -421,13 +425,19 @@ check_not_contains() { # <needle> <label> [haystack]
   case "$hay" in *"$1"*) fail "$2" "unexpected substring: $1" ;; *) pass "$2" ;; esac
 }
 
+# Both of these feed the haystack in on a herestring rather than through a pipe.
+# grep -q exits the instant it matches, so `printf ... | grep -q` leaves printf
+# writing into a closed pipe; it dies of SIGPIPE (141) and `set -o pipefail`
+# makes the whole pipeline report that failure even though grep matched. Whether
+# printf gets all its bytes into the pipe buffer first is a race the haystack
+# size decides — a 45KB page loses it reproducibly. A herestring has no pipe.
 check_matches() { # <extended regex> <label> [haystack]
   local hay="${3-$HTTP_BODY}"
-  if printf '%s' "$hay" | grep -Eqi -- "$1"; then pass "$2"; else fail "$2" "no match for: $1"; fi
+  if grep -Eqi -- "$1" <<<"$hay"; then pass "$2"; else fail "$2" "no match for: $1"; fi
 }
 
 check_header() { # <extended regex> <label>
-  if printf '%s' "$HTTP_HEADERS" | grep -Eqi -- "$1"; then pass "$2"; else fail "$2" "no header matching: $1"; fi
+  if grep -Eqi -- "$1" <<<"$HTTP_HEADERS"; then pass "$2"; else fail "$2" "no header matching: $1"; fi
 }
 
 check_key() { # <label> <key...>
@@ -576,6 +586,9 @@ auth_checks() {
   assert_status_in "401 403" "a wrong ?k= is rejected" "/?k=definitely-not-the-frame-key-000000000000"
 
   rm -f "$JAR_MAIN"
+  # ALLOW_QUERY_KEY is unset on this instance, i.e. the shipped default: the key
+  # is accepted once and then redirected away. The opposite mode is exercised on
+  # a dedicated instance in query_key_checks below.
   assert_status 303 "a correct ?k= returns 303" "/?k=$FRAME_KEY" -c "$JAR_MAIN"
 
   local loc
@@ -824,6 +837,42 @@ failover_checks() { # <base> <primary port> <primary state> <primary pid> <fallb
 }
 
 # ---------------------------------------------------------------------------
+# Section 10 — ALLOW_QUERY_KEY
+# ---------------------------------------------------------------------------
+
+query_key_checks() { # <base url>
+  section "Query-key mode (ALLOW_QUERY_KEY=true)"
+
+  local saved="$BASE"
+  BASE="$1"
+
+  # An iOS home-screen web app cannot inherit Safari's cookie, so its icon URL
+  # carries ?k= on every launch: the key must authenticate the request that
+  # carries it, not a redirect target the app arrives at with nothing.
+  rm -f "$JAR_QK"
+  http "/?k=$FRAME_KEY" -c "$JAR_QK"
+  check_eq "200" "$HTTP_STATUS" "a correct ?k= is served directly, not redirected"
+  check_matches '<html' "the ?k= response is the frame page itself"
+  check_header '^set-cookie:[[:space:]]*__host-' "the ?k= response still sets the session cookie"
+
+  # Every subsequent launch reloads the same URL. It must work whether or not
+  # the cookie from the last launch survived.
+  http "/?k=$FRAME_KEY" -b "$JAR_QK"
+  check_eq "200" "$HTTP_STATUS" "a repeat ?k= launch is served, not redirected"
+  check_matches '<html' "the repeat launch still serves the frame page"
+
+  http "/api/state?k=$FRAME_KEY"
+  check_eq "200" "$HTTP_STATUS" "?k= authenticates /api/state without a redirect hop"
+
+  # The flag relaxes where a valid key is honoured, nothing else.
+  assert_status_in "401 403" "a wrong ?k= is still rejected" \
+    "/?k=definitely-not-the-frame-key-000000000000"
+  assert_status 401 "no credentials are still 401" /api/state
+
+  BASE="$saved"
+}
+
+# ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 
@@ -844,6 +893,7 @@ HA_FO_FALLBACK_PORT="$(free_port)"
 SRV_PORT="$(free_port)"
 SRV_RL_PORT="$(free_port)"
 SRV_FO_PORT="$(free_port)"
+SRV_QK_PORT="$(free_port)"
 
 start_stub ha-main "$HA_PORT" "$STATE_MAIN"
 wait_http "http://127.0.0.1:$HA_PORT/api/" || fatal "the main Home Assistant stub did not start"
@@ -874,6 +924,20 @@ if wait_http "http://127.0.0.1:$SRV_RL_PORT/healthz"; then
   ratelimit_checks "http://127.0.0.1:$SRV_RL_PORT"
 else
   fail "the TRUST_PROXY=1 instance starts" "log: $(tail -n 3 "$TMP/srv-rl.log" | tr '\n' ' ')"
+fi
+
+# A dedicated instance for the opt-in flag: the main instance must keep proving
+# the shipped default. AUTH_MAX_FAILS is high here for the same reason as the
+# main instance — TRUST_PROXY is unset, so the two deliberate 401s below would
+# otherwise share a bucket with the assertions around them.
+start_server srv-qk "$SRV_QK_PORT" \
+  HA_BASE_URL="http://127.0.0.1:$HA_PORT" \
+  ALLOW_QUERY_KEY=true \
+  AUTH_MAX_FAILS=1000
+if wait_http "http://127.0.0.1:$SRV_QK_PORT/healthz"; then
+  query_key_checks "http://127.0.0.1:$SRV_QK_PORT"
+else
+  fail "the ALLOW_QUERY_KEY=true instance starts" "log: $(tail -n 3 "$TMP/srv-qk.log" | tr '\n' ' ')"
 fi
 
 behaviour_checks "$STATE_MAIN"

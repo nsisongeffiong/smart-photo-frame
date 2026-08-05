@@ -396,6 +396,7 @@ It covers, in order:
 | Security headers | `nosniff`, `no-referrer`, CSP present, CSP includes `frame-ancestors` |
 | Path safety | `../`, `%2e%2e` and deep traversal all blocked and leak no bytes; dotfiles not served; filenames with spaces served |
 | Hostile input | Albums literally named `__proto__`, `constructor`, `toString` and `<img src=x onerror=alert(1)>` do not corrupt state or produce a 5xx; non-image files excluded; an oversized album is capped; an unreadable album does not abort the scan |
+| Query-key mode | On a dedicated `ALLOW_QUERY_KEY=true` instance: a correct `?k=` serves the frame page with a 200 and still sets the session cookie, a repeat launch on the same URL is served again, `/api/state?k=` needs no redirect hop, and a wrong or absent key is still rejected |
 | Home Assistant propagation | Album, display, brightness and interval all propagate from HA and revert |
 | Failover and degradation | `haVia` reports primary, switches to fallback when the primary dies, `haOk` goes false only when both die, the last known album is retained, photos keep being served, and `haVia` returns to primary once it recovers |
 | Logging | Log lines are JSON objects carrying `ts`, `level`, `message` |
@@ -576,6 +577,7 @@ default.
 | `MAX_PHOTOS_PER_ALBUM` | `5000` | 1 – 200000 |
 | `AUTH_MAX_FAILS` | `10` | 1 – 1000 |
 | `AUTH_WINDOW_MS` | `900000` | 1000 – 86400000 |
+| `ALLOW_QUERY_KEY` | `false` | `true`/`1` or `false`/`0`. When true a valid `?k=` is served directly instead of 303'ing to the bare path — needed for an iOS home-screen web app, which cannot inherit Safari's cookie. Cost: the key persists in the icon URL on the device and appears in proxy access logs |
 | `TRUST_PROXY` | `false` | Set to `1` behind a reverse proxy. Also accepts `true`, `false`, `loopback`, `uniquelocal`, or a comma-separated address list |
 | `ENTITY_ALBUM` | `input_select.photo_frame_album` | Must match `domain.object_id` |
 | `ENTITY_DISPLAY` | `input_boolean.photo_frame_display` | |
@@ -601,7 +603,7 @@ fix can reveal another behind it. Validation order is: missing required
 variables (all named at once) → `FRAME_KEY` strength → `HA_BASE_URL` →
 `HA_BASE_URL_FALLBACK` → `HA_POLL_MS` → `PORT` → `SCAN_MS` →
 `HA_REPROBE_EVERY` → `MAX_PHOTOS_PER_ALBUM` → `AUTH_MAX_FAILS` →
-`AUTH_WINDOW_MS` → the four `ENTITY_*` variables. Note that `HA_POLL_MS` is
+`AUTH_WINDOW_MS` → `ALLOW_QUERY_KEY` → the four `ENTITY_*` variables. Note that `HA_POLL_MS` is
 checked before `PORT`, which is not the order the table above lists.
 
 Integers must be exact: `"10000 "` is fine (trimmed), but `1e4`, `10_000` and
