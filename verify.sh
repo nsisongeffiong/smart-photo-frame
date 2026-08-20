@@ -1,1001 +1,1060 @@
 #!/usr/bin/env bash
 #
-# verify.sh — regression harness for smart-photo-frame.
+# smart-photo-frame — verification harness
 #
-# Boots the real server.js against stub Home Assistant instances that this
-# script creates itself, asserts the shipped contract, cleans up every child
-# process and temp file on exit, and exits non-zero if any assertion failed.
+# Regression net for everything the server has ever shipped, plus the four
+# changes from the pre-open-source review:
 #
-# Requirements: bash, curl, node. No test framework.
-# Run with:  bash verify.sh
+#   1. haOk derives from the number of entity states actually accepted, not from
+#      the number of HTTP 200s. A poll where every entity is "unavailable" is not
+#      a successful poll and must not advance haLastOk.
+#   2. /healthz returns { ok } only. Status semantics (200/503) unchanged, because
+#      the container HEALTHCHECK reads statusCode and nothing else.
+#   3. TRUST_PROXY still defaults to false, but a falsy effective value now emits
+#      exactly one warning line at boot.
+#   4. .heic/.heif/.webp are out of the default image set (iOS 12 cannot decode
+#      them); the set is overridable with IMAGE_EXTENSIONS; the scanner logs a
+#      count of skipped images.
 #
-# Harness notes (read before "fixing" a failure):
+# Conventions, learned the hard way:
+#   - Every assertion that can 401 gets its own X-Forwarded-For address. Trust
+#     proxy is enabled for the main run, so a shared address would drag later
+#     requests into an earlier assertion's cooldown bucket.
+#   - grep is always fed by a herestring, never a pipe: `printf ... | grep -q`
+#     under `set -o pipefail` dies of SIGPIPE when grep exits on the first match,
+#     and whether it does is a race decided by the size of the haystack.
 #
-#  * The session cookie is Secure. curl only sends Secure cookies over a
-#    secure context, so every request targets 127.0.0.1 — curl treats
-#    localhost/127.0.0.1/::1 as secure. Do not switch this to a hostname.
-#  * curl discards Set-Cookie when following a redirect without a jar, so the
-#    303 follow-up is always exercised with -c/-b. A 401 there is a harness
-#    bug, not a server defect.
-#  * The main instance runs with TRUST_PROXY unset (the shipped default). In
-#    that mode the auth limiter degrades to a single global bucket: failures
-#    from any client throttle every other client. That is why the main
-#    instance is started with a very high AUTH_MAX_FAILS — otherwise the
-#    handful of deliberate 401s below drag unrelated assertions into 429.
-#    The limiter itself is exercised on a dedicated TRUST_PROXY=1 instance,
-#    where every request carries its own X-Forwarded-For address.
-#  * public/index.html has a header comment listing forbidden syntax. HTML,
-#    block and line comments are stripped before scanning for ?. and ?? —
-#    the comment is documentation, not a defect.
-#  * Assertions that grep a response never pipe into grep -q; see the comment on
-#    check_matches. pipefail plus an early-exiting grep turns a match into a
-#    failure whenever the haystack is big enough to lose the SIGPIPE race.
+# Exit code: 0 when every assertion passes, 1 otherwise.
 
-set -uo pipefail
+set -Eeuo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$ROOT" || exit 1
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-FRAME_KEY="spf-harness-frame-key-0123456789abcdef0123456789"
-HA_TOKEN="spf-harness-ha-token"
-MAX_PHOTOS=4
-RL_MAX_FAILS=5
-
-ENTITY_ALBUM="input_select.frame_album"
-ENTITY_DISPLAY="input_boolean.frame_display"
-ENTITY_BRIGHTNESS="input_number.frame_brightness"
-ENTITY_INTERVAL="input_number.frame_interval"
-
-# ---------------------------------------------------------------------------
-# Reporting
-# ---------------------------------------------------------------------------
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SERVER="$ROOT/server.js"
 
 PASS=0
 FAIL=0
-SKIP=0
-FAILED=()
+XFF_N=0
+PIDS=()
+WORK=""
 
-if [ -t 1 ]; then
-  C_OK=$'\033[32m'; C_BAD=$'\033[31m'; C_SKIP=$'\033[33m'; C_HDR=$'\033[1m'; C_OFF=$'\033[0m'
-else
-  C_OK=""; C_BAD=""; C_SKIP=""; C_HDR=""; C_OFF=""
-fi
+CODE=""
+BODY=""
+HEADERS=""
+BASE=""
 
-section() { printf '\n%s== %s ==%s\n' "$C_HDR" "$1" "$C_OFF"; }
-pass()    { PASS=$((PASS + 1)); printf '  %sPASS%s %s\n' "$C_OK" "$C_OFF" "$1"; }
-skip()    { SKIP=$((SKIP + 1)); printf '  %sSKIP%s %s (%s)\n' "$C_SKIP" "$C_OFF" "$1" "${2:-}"; }
+FRAME_KEY="verify-frame-key-7Qx3Zk91Ap"
+HA_TOKEN="verify-ha-token-b41c9d7e2f8a"
+PROBE_IP="192.0.2.250"
+
+# --------------------------------------------------------------------------- #
+# Harness plumbing
+# --------------------------------------------------------------------------- #
+
+ok() {
+  PASS=$((PASS + 1))
+  printf 'PASS  %s\n' "$1"
+}
+
 fail() {
   FAIL=$((FAIL + 1))
-  FAILED+=("$1")
-  printf '  %sFAIL%s %s\n' "$C_BAD" "$C_OFF" "$1"
-  [ $# -gt 1 ] && printf '       %s\n' "$2"
-  return 0
+  if [ -n "${2:-}" ]; then
+    printf 'FAIL  %s -- %s\n' "$1" "$2"
+  else
+    printf 'FAIL  %s\n' "$1"
+  fi
 }
-fatal() { printf '\n%sFATAL%s %s\n' "$C_BAD" "$C_OFF" "$1" >&2; exit 1; }
 
-# ---------------------------------------------------------------------------
-# Workspace and cleanup
-# ---------------------------------------------------------------------------
+assert_eq() { # name actual expected
+  if [ "$2" = "$3" ]; then ok "$1"; else fail "$1" "expected [$3], got [$2]"; fi
+}
 
-command -v curl >/dev/null 2>&1 || fatal "curl is required"
-command -v node >/dev/null 2>&1 || fatal "node is required"
-[ -f server.js ] || fatal "server.js not found in $ROOT"
-[ -f public/index.html ] || fatal "public/index.html not found in $ROOT"
+assert_ne() { # name actual unexpected
+  if [ "$2" != "$3" ]; then ok "$1"; else fail "$1" "got the forbidden value [$3]"; fi
+}
 
-TMP="$(mktemp -d "${TMPDIR:-/tmp}/spf-verify.XXXXXX")" || fatal "cannot create temp dir"
-PIDS=()
-# Set by start_stub/start_server to the PID of the process they just launched.
-# Read it immediately after the call: a later call overwrites it.
-LAST_PID=""
+assert_contains() { # name haystack needle
+  if grep -qF -- "$3" <<< "$2"; then ok "$1"; else fail "$1" "missing [$3]"; fi
+}
+
+assert_not_contains() { # name haystack needle
+  if grep -qF -- "$3" <<< "$2"; then fail "$1" "unexpectedly present [$3]"; else ok "$1"; fi
+}
+
+assert_matches() { # name haystack extended-regex
+  if grep -qiE -- "$3" <<< "$2"; then ok "$1"; else fail "$1" "no match for /$3/"; fi
+}
 
 cleanup() {
   local pid
-  for pid in ${PIDS[@]+"${PIDS[@]}"}; do kill "$pid" >/dev/null 2>&1; done
-  sleep 0.2
-  for pid in ${PIDS[@]+"${PIDS[@]}"}; do kill -9 "$pid" >/dev/null 2>&1; done
-  chmod -R u+rwX "$TMP" >/dev/null 2>&1
-  rm -rf "$TMP"
-}
-trap cleanup EXIT INT TERM
-
-PHOTOS="$TMP/photos"
-JAR_MAIN="$TMP/jar-main"
-JAR_RL="$TMP/jar-rl"
-JAR_FO="$TMP/jar-fo"
-JAR_QK="$TMP/jar-qk"
-
-# ---------------------------------------------------------------------------
-# Node helpers
-# ---------------------------------------------------------------------------
-
-cat >"$TMP/jsonq.js" <<'JSONQ'
-'use strict';
-/**
- * Read JSON from stdin, print the value addressed by the argv key path.
- * Usage: jsonq.js [--count] [key ...]
- * Output: __INVALID_JSON__ | __MISSING__ | __VALID__ | scalar | __ARRAY__<n>
- *         | compact JSON. With --count: a cardinality, or __NA__.
- */
-let raw = '';
-process.stdin.setEncoding('utf8');
-process.stdin.on('data', (chunk) => { raw += chunk; });
-process.stdin.on('end', () => {
-  const args = process.argv.slice(2);
-  const wantCount = args[0] === '--count';
-  const keys = wantCount ? args.slice(1) : args;
-  let cur;
-  try { cur = JSON.parse(raw); } catch (err) { console.log('__INVALID_JSON__'); return; }
-  for (const key of keys) {
-    if (cur === null || typeof cur !== 'object' ||
-        !Object.prototype.hasOwnProperty.call(cur, key)) {
-      console.log('__MISSING__');
-      return;
-    }
-    cur = cur[key];
-  }
-  if (wantCount) {
-    if (typeof cur === 'number') console.log(String(cur));
-    else if (Array.isArray(cur)) console.log(String(cur.length));
-    else if (cur && typeof cur === 'object') console.log(String(Object.keys(cur).length));
-    else console.log('__NA__');
-    return;
-  }
-  if (!keys.length) { console.log('__VALID__'); return; }
-  if (cur === null || typeof cur !== 'object') console.log(String(cur));
-  else if (Array.isArray(cur)) console.log('__ARRAY__' + cur.length);
-  else console.log(JSON.stringify(cur));
-});
-JSONQ
-
-cat >"$TMP/strip-comments.js" <<'STRIP'
-'use strict';
-/** Print a file with HTML, block and line comments removed. */
-const fs = require('fs');
-let src = fs.readFileSync(process.argv[2], 'utf8');
-src = src.replace(/<!--[\s\S]*?-->/g, '\n');
-src = src.replace(/\/\*[\s\S]*?\*\//g, '\n');
-src = src.replace(/(^|[^:\\])\/\/[^\n]*/g, '$1');
-process.stdout.write(src);
-STRIP
-
-cat >"$TMP/setent.js" <<'SETENT'
-'use strict';
-/** Mutate one entity state in a stub Home Assistant state file. */
-const fs = require('fs');
-const [file, entity, state] = process.argv.slice(2);
-const doc = JSON.parse(fs.readFileSync(file, 'utf8'));
-if (doc[entity] && typeof doc[entity] === 'object') doc[entity].state = state;
-else doc[entity] = { state };
-fs.writeFileSync(file, JSON.stringify(doc, null, 2));
-SETENT
-
-cat >"$TMP/ha-stub.js" <<'HASTUB'
-'use strict';
-/**
- * Minimal Home Assistant REST stub. Reads its state file on every request so
- * the harness can change entity states by rewriting the file.
- * Usage: ha-stub.js <port> <stateFile>
- */
-const http = require('http');
-const fs = require('fs');
-
-const port = Number(process.argv[2]);
-const stateFile = process.argv[3];
-
-function entities() {
-  const doc = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
-  const now = new Date().toISOString();
-  return Object.keys(doc).map((entity_id) => {
-    const raw = doc[entity_id];
-    const value = raw && typeof raw === 'object' ? raw : { state: raw };
-    return {
-      entity_id,
-      state: String(value.state),
-      attributes: value.attributes || {},
-      last_changed: now,
-      last_updated: now,
-      context: { id: 'harness', parent_id: null, user_id: null }
-    };
-  });
-}
-
-function send(res, code, payload) {
-  const body = JSON.stringify(payload);
-  res.writeHead(code, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
-  res.end(body);
-}
-
-http.createServer((req, res) => {
-  const path = decodeURIComponent((req.url || '').split('?')[0]);
-  try {
-    if (path === '/api/' || path === '/api') return send(res, 200, { message: 'API running.' });
-    if (path === '/api/config') return send(res, 200, { version: '2024.1.0', state: 'RUNNING' });
-    if (path === '/api/states') return send(res, 200, entities());
-    if (path.startsWith('/api/states/')) {
-      const id = path.slice('/api/states/'.length);
-      const hit = entities().find((e) => e.entity_id === id);
-      return hit ? send(res, 200, hit) : send(res, 404, { message: 'Entity not found.' });
-    }
-    return send(res, 404, { message: 'Not found.' });
-  } catch (err) {
-    return send(res, 500, { message: String(err && err.message) });
-  }
-}).listen(port, '127.0.0.1');
-HASTUB
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-mkimg() { printf '\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9' >"$1"; }
-
-build_fixtures() {
-  mkdir -p "$PHOTOS"
-  printf 'traversal-canary-do-not-serve\n' >"$TMP/secret.txt"
-
-  mkdir -p "$PHOTOS/family"
-  mkimg "$PHOTOS/family/one.jpg"
-  mkimg "$PHOTOS/family/two.png"
-  mkimg "$PHOTOS/family/a photo with spaces.jpg"
-  printf 'not an image\n' >"$PHOTOS/family/notes.txt"
-  printf 'not an image\n' >"$PHOTOS/family/clip.mp4"
-
-  mkdir -p "$PHOTOS/capped"
-  for n in 1 2 3 4 5 6 7; do mkimg "$PHOTOS/capped/c$n.jpg"; done
-
-  mkdir -p "$PHOTOS/dotty"
-  mkimg "$PHOTOS/dotty/visible.jpg"
-  mkimg "$PHOTOS/dotty/.secret.jpg"
-
-  # Hostile album names: prototype keys and an XSS payload.
-  for hostile in '__proto__' 'constructor' 'toString' '<img src=x onerror=alert(1)>'; do
-    mkdir -p "$PHOTOS/$hostile"
-    mkimg "$PHOTOS/$hostile/p.jpg"
+  for pid in "${PIDS[@]:-}"; do
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    fi
   done
-
-  mkdir -p "$PHOTOS/noperm"
-  mkimg "$PHOTOS/noperm/n.jpg"
-  chmod 000 "$PHOTOS/noperm"
+  if [ -n "$WORK" ] && [ -d "$WORK" ]; then
+    rm -rf "$WORK"
+  fi
+  return 0
 }
+trap cleanup EXIT
 
-write_state_file() { # <file> <album>
-  cat >"$1" <<JSON
-{
-  "$ENTITY_ALBUM": { "state": "$2", "attributes": { "options": ["family", "capped", "dotty"] } },
-  "$ENTITY_DISPLAY": { "state": "on" },
-  "$ENTITY_BRIGHTNESS": { "state": "42", "attributes": { "min": 0, "max": 100, "step": 1 } },
-  "$ENTITY_INTERVAL": { "state": "25", "attributes": { "min": 5, "max": 600, "step": 1 } }
+for tool in node curl; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    printf 'verify.sh: required tool not found: %s\n' "$tool" >&2
+    exit 1
+  fi
+done
+
+if [ ! -f "$SERVER" ]; then
+  printf 'verify.sh: server.js not found at %s\n' "$SERVER" >&2
+  exit 1
+fi
+
+NODE_BIN="$(command -v node)"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/spf-verify-XXXXXX")"
+
+next_xff() {
+  XFF_N=$((XFF_N + 1))
+  printf '198.51.100.%d' "$XFF_N"
 }
-JSON
-}
-
-set_entity() { node "$TMP/setent.js" "$1" "$2" "$3"; }
-
-# ---------------------------------------------------------------------------
-# Process control
-# ---------------------------------------------------------------------------
 
 free_port() {
-  node -e 'const s=require("net").createServer();s.listen(0,"127.0.0.1",()=>{const p=s.address().port;s.close(()=>console.log(p));});'
+  "$NODE_BIN" -e '
+    const net = require("net");
+    const s = net.createServer();
+    s.listen(0, "127.0.0.1", () => {
+      const p = s.address().port;
+      s.close(() => process.stdout.write(String(p)));
+    });
+  '
 }
 
-# The PID is published in LAST_PID rather than on stdout: a command
-# substitution would run this in a subshell, and the PIDS+=() registration —
-# the only thing that lets cleanup reap the stub and free its port — would be
-# discarded along with that subshell.
-start_stub() { # <name> <port> <stateFile> -> sets LAST_PID
-  local name="$1" port="$2" state="$3"
-  node "$TMP/ha-stub.js" "$port" "$state" >"$TMP/$name.log" 2>&1 &
-  LAST_PID=$!
-  PIDS+=("$LAST_PID")
+jfield() { # path json
+  "$NODE_BIN" -e '
+    let s = "";
+    process.stdin.on("data", (c) => { s += c; });
+    process.stdin.on("end", () => {
+      let v;
+      try { v = JSON.parse(s); } catch { process.stdout.write("<invalid-json>"); return; }
+      const out = String(process.argv[1]).split(".").reduce(
+        (a, k) => (a === null || a === undefined ? undefined : a[k]), v);
+      if (out === undefined) { process.stdout.write("<missing>"); return; }
+      process.stdout.write(typeof out === "object" ? JSON.stringify(out) : String(out));
+    });
+  ' "$1" <<< "$2"
 }
 
-wait_http() { # <url> -> 0 when reachable
-  local url="$1" i
-  for i in $(seq 1 120); do
-    curl -sS -o /dev/null --max-time 2 "$url" >/dev/null 2>&1 && return 0
+jkeys() { # json
+  "$NODE_BIN" -e '
+    let s = "";
+    process.stdin.on("data", (c) => { s += c; });
+    process.stdin.on("end", () => {
+      let v;
+      try { v = JSON.parse(s); } catch { process.stdout.write("<invalid-json>"); return; }
+      if (v === null || typeof v !== "object") { process.stdout.write("<not-an-object>"); return; }
+      process.stdout.write(Object.keys(v).sort().join(","));
+    });
+  ' <<< "$1"
+}
+
+req_ip() { # path ip [curl args...]
+  local path="$1" ip="$2"
+  shift 2
+  local bodyf="$WORK/resp.body" hdrf="$WORK/resp.head"
+  : > "$bodyf"
+  : > "$hdrf"
+  CODE="$(curl -sS --max-time 15 -o "$bodyf" -D "$hdrf" -w '%{http_code}' \
+    -H "X-Forwarded-For: $ip" "$@" "$BASE$path" 2>>"$WORK/curl.err" || printf '000')"
+  BODY="$(cat "$bodyf")"
+  HEADERS="$(cat "$hdrf")"
+}
+
+req() { # path [curl args...]
+  local path="$1"
+  shift
+  req_ip "$path" "$(next_xff)" "$@"
+}
+
+start_server() { # logfile VAR=VAL...
+  local log="$1"
+  shift
+  : > "$log"
+  env -i PATH="$PATH" HOME="${HOME:-/tmp}" "$@" "$NODE_BIN" "$SERVER" >> "$log" 2>&1 &
+  SERVER_PID=$!
+  PIDS+=("$SERVER_PID")
+  local i=0
+  while [ "$i" -lt 150 ]; do
+    if grep -q '"message":"listening"' "$log" 2>/dev/null; then return 0; fi
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then return 1; fi
     sleep 0.1
+    i=$((i + 1))
   done
   return 1
 }
 
-start_server() { # <name> <port> [EXTRA=env ...] -> sets LAST_PID
-  local name="$1" port="$2"
-  shift 2
-  # Every tuning value below must sit inside the range server.js enforces in
-  # loadConfig(), or the process exits on a ConfigError before it ever listens:
-  # HA_POLL_MS >= 1000, SCAN_MS >= 5000, HA_REPROBE_EVERY 1..10000,
-  # MAX_PHOTOS_PER_ALBUM 1..200000, AUTH_WINDOW_MS >= 1000, AUTH_MAX_FAILS
-  # 1..1000. HA_POLL_MS is pinned to the floor so poll-driven assertions settle
-  # fast; assert_val's 12s budget absorbs the resulting 1s cadence and the 2s
-  # derived HA timeout. Nothing here waits on a second filesystem scan, so
-  # SCAN_MS only needs to be legal, not brisk.
-  env PORT="$port" \
-      HA_TOKEN="$HA_TOKEN" \
-      FRAME_KEY="$FRAME_KEY" \
-      PHOTOS_DIR="$PHOTOS" \
-      HA_POLL_MS=1000 \
-      SCAN_MS=5000 \
-      HA_REPROBE_EVERY=3 \
-      MAX_PHOTOS_PER_ALBUM="$MAX_PHOTOS" \
-      AUTH_WINDOW_MS=600000 \
-      ENTITY_ALBUM="$ENTITY_ALBUM" \
-      ENTITY_DISPLAY="$ENTITY_DISPLAY" \
-      ENTITY_BRIGHTNESS="$ENTITY_BRIGHTNESS" \
-      ENTITY_INTERVAL="$ENTITY_INTERVAL" \
-      "$@" node server.js >"$TMP/$name.log" 2>&1 &
-  LAST_PID=$!
-  PIDS+=("$LAST_PID")
+stop_server() { # pid
+  local pid="${1:-}"
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  fi
 }
 
-# Refuse anything that is not a plausible child PID. A mis-wired caller must
-# never be able to signal an unrelated process; 0 and 1 are singled out because
-# `kill 0` signals this harness's whole process group and 1 is init.
-stop_pid() { # <pid>
-  [[ ${1:-} =~ ^[0-9]+$ ]] && [ "$1" -gt 1 ] || return 0
-  kill "$1" >/dev/null 2>&1
-  sleep 0.3
-  kill -9 "$1" >/dev/null 2>&1
-  return 0
+write_ha_state() { # json
+  printf '%s' "$1" > "$WORK/ha-state.next"
+  mv "$WORK/ha-state.next" "$WORK/ha-state.json"
 }
 
-# ---------------------------------------------------------------------------
-# HTTP helpers
-# ---------------------------------------------------------------------------
-
-BASE=""
-XFF_N=0
-XFF_OVERRIDE=""
-HTTP_STATUS=""
-HTTP_BODY=""
-HTTP_HEADERS=""
-
-# A fresh forwarded-for address per request keeps unrelated assertions out of
-# each other's rate-limit buckets.
-next_ip() {
-  XFF_N=$((XFF_N + 1))
-  printf '198.51.%d.%d' "$(((XFF_N / 250) % 250))" "$((XFF_N % 250 + 1))"
+state_value() { # field
+  req_ip /api/state "$PROBE_IP" -H "Cookie: __Host-spf=$SESSION"
+  jfield "$1" "$BODY"
 }
 
-http() { # <path> [curl args...]
-  local path="$1"
-  shift
-  local ip="${XFF_OVERRIDE:-$(next_ip)}"
-  : >"$TMP/body"
-  : >"$TMP/hdrs"
-  HTTP_STATUS="$(curl -sS --max-time 15 -o "$TMP/body" -D "$TMP/hdrs" -w '%{http_code}' \
-    -H "X-Forwarded-For: $ip" "$@" "$BASE$path" 2>>"$TMP/curl.err")"
-  [ -z "$HTTP_STATUS" ] && HTTP_STATUS="000"
-  HTTP_BODY="$(tr -d '\000' <"$TMP/body")"
-  HTTP_HEADERS="$(tr -d '\r' <"$TMP/hdrs")"
-}
-
-http_ip() { # <ip> <path> [curl args...]
-  XFF_OVERRIDE="$1"
-  shift
-  http "$@"
-  XFF_OVERRIDE=""
-}
-
-header_value() { printf '%s' "$HTTP_HEADERS" | awk -v k="$(printf '%s' "$1" | tr 'A-Z' 'a-z'):" 'tolower($1)==k{$1="";sub(/^ /,"");print;exit}'; }
-jval() { printf '%s' "$HTTP_BODY" | node "$TMP/jsonq.js" "$@"; }
-
-# ---------------------------------------------------------------------------
-# Assertions
-# ---------------------------------------------------------------------------
-
-assert_status() { # <expected> <label> <path> [curl args...]
-  local exp="$1" label="$2"
-  shift 2
-  http "$@"
-  [ "$HTTP_STATUS" = "$exp" ] && { pass "$label"; return 0; }
-  fail "$label" "expected $exp, got $HTTP_STATUS for $1"
-}
-
-assert_status_in() { # "<a b c>" <label> <path> [curl args...]
-  local allowed="$1" label="$2"
-  shift 2
-  http "$@"
-  case " $allowed " in
-    *" $HTTP_STATUS "*) pass "$label" ;;
-    *) fail "$label" "expected one of [$allowed], got $HTTP_STATUS for $1" ;;
-  esac
-}
-
-check_eq() { # <expected> <actual> <label>
-  [ "$1" = "$2" ] && { pass "$3"; return 0; }
-  fail "$3" "expected '$1', got '$2'"
-}
-
-check_ge() { # <actual> <min> <label>
-  if [ "$1" -ge "$2" ] 2>/dev/null; then pass "$3"; else fail "$3" "expected >= $2, got '$1'"; fi
-}
-
-check_contains() { # <needle> <label> [haystack]
-  local hay="${3-$HTTP_BODY}"
-  case "$hay" in *"$1"*) pass "$2" ;; *) fail "$2" "missing substring: $1" ;; esac
-}
-
-check_not_contains() { # <needle> <label> [haystack]
-  local hay="${3-$HTTP_BODY}"
-  case "$hay" in *"$1"*) fail "$2" "unexpected substring: $1" ;; *) pass "$2" ;; esac
-}
-
-# Both of these feed the haystack in on a herestring rather than through a pipe.
-# grep -q exits the instant it matches, so `printf ... | grep -q` leaves printf
-# writing into a closed pipe; it dies of SIGPIPE (141) and `set -o pipefail`
-# makes the whole pipeline report that failure even though grep matched. Whether
-# printf gets all its bytes into the pipe buffer first is a race the haystack
-# size decides — a 45KB page loses it reproducibly. A herestring has no pipe.
-check_matches() { # <extended regex> <label> [haystack]
-  local hay="${3-$HTTP_BODY}"
-  if grep -Eqi -- "$1" <<<"$hay"; then pass "$2"; else fail "$2" "no match for: $1"; fi
-}
-
-check_header() { # <extended regex> <label>
-  if grep -Eqi -- "$1" <<<"$HTTP_HEADERS"; then pass "$2"; else fail "$2" "no header matching: $1"; fi
-}
-
-check_key() { # <label> <key...>
-  local label="$1"
-  shift
-  local v
-  v="$(jval "$@")"
-  case "$v" in
-    __MISSING__ | __INVALID_JSON__) fail "$label" "key path '$*' -> $v" ;;
-    *) pass "$label" ;;
-  esac
-}
-
-check_valid_json() { # <label>
-  local v
-  v="$(jval)"
-  [ "$v" = "__VALID__" ] && { pass "$1"; return 0; }
-  fail "$1" "response is not valid JSON"
-}
-
-# Poll /api/state until the addressed value falls in the allowed set.
-wait_val() { # <"allowed values"> <timeout_s> <key...> -> echoes observed value
-  local allowed="$1" secs="$2"
-  shift 2
-  local deadline=$((SECONDS + secs)) got=""
-  while :; do
-    http /api/state -b "$JAR"
-    got="$(jval "$@")"
-    case " $allowed " in *" $got "*) break ;; esac
-    [ "$SECONDS" -ge "$deadline" ] && break
+wait_state() { # field expected tries
+  local i=0
+  while [ "$i" -lt "$3" ]; do
+    if [ "$(state_value "$1")" = "$2" ]; then return 0; fi
     sleep 0.25
+    i=$((i + 1))
   done
-  printf '%s' "$got"
+  return 1
 }
 
-assert_val() { # <label> <"allowed values"> <key...>
-  local label="$1" allowed="$2"
-  shift 2
-  local got
-  got="$(wait_val "$allowed" 12 "$@")"
-  case " $allowed " in
-    *" $got "*) pass "$label" ;;
-    *) fail "$label" "$* = '$got', wanted one of [$allowed]" ;;
-  esac
-}
-
-# ---------------------------------------------------------------------------
-# Section 1 — static analysis
-# ---------------------------------------------------------------------------
-
-static_checks() {
-  section "Static analysis"
-
-  if node --check server.js >"$TMP/node-check.log" 2>&1; then
-    pass "server.js parses (node --check)"
-  else
-    fail "server.js parses (node --check)" "$(head -n 3 "$TMP/node-check.log" | tr '\n' ' ')"
+run_unit() { # script.mjs
+  local script="$1"
+  local out=""
+  if ! out="$("$NODE_BIN" "$script" 2>&1)"; then
+    fail "unit $(basename "$script")" "$(printf '%s' "$out" | tail -n 5 | tr '\n' ' ')"
+    return 0
   fi
-
-  local client="public/index.html"
-  local stripped="$TMP/client.stripped"
-  if node "$TMP/strip-comments.js" "$client" >"$stripped" 2>"$TMP/strip.err"; then
-    pass "client comment stripping succeeded"
-  else
-    fail "client comment stripping succeeded" "$(head -n 2 "$TMP/strip.err" | tr '\n' ' ')"
-    cp "$client" "$stripped"
-  fi
-
-  # Credentials: scanned on the raw file, precise patterns only.
-  if grep -Fq "$FRAME_KEY" "$client"; then
-    fail "client holds no frame key"
-  else
-    pass "client holds no frame key"
-  fi
-  if grep -Eq 'eyJhbGciOi|Bearer[[:space:]]+[A-Za-z0-9._~+/-]{16,}' "$client"; then
-    fail "client holds no bearer token"
-  else
-    pass "client holds no bearer token"
-  fi
-
-  # Host / API references: scanned post-strip, the header comment may name them.
-  local pat label
-  while IFS='|' read -r pat label; do
-    [ -z "$pat" ] && continue
-    if grep -Eq -- "$pat" "$stripped"; then
-      fail "client never references $label"
-    else
-      pass "client never references $label"
-    fi
-  done <<'PATTERNS'
-:8123|the HA port
-/api/states/|the HA states API
-nabu\.casa|a Nabu Casa host
-\.ts\.net|a Tailscale host
-HA_TOKEN|the HA token variable
-Authorization|an Authorization header
-PATTERNS
-
-  if grep -q '?\.' "$stripped"; then
-    fail "client is free of optional chaining" "found ?. outside comments"
-  else
-    pass "client is free of optional chaining"
-  fi
-  if grep -q '??' "$stripped"; then
-    fail "client is free of nullish coalescing" "found ?? outside comments"
-  else
-    pass "client is free of nullish coalescing"
-  fi
-
-  if [ ! -f package.json ]; then
-    skip "npm audit reports no high or critical findings" "no package.json"
-  elif ! command -v npm >/dev/null 2>&1; then
-    skip "npm audit reports no high or critical findings" "npm unavailable"
-  else
-    npm audit --json >"$TMP/audit.json" 2>"$TMP/audit.err"
-    local counted
-    counted="$(node -e '
-      const fs = require("fs");
-      try {
-        const doc = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-        const v = (doc.metadata && doc.metadata.vulnerabilities) || {};
-        console.log(String((v.high || 0) + (v.critical || 0)));
-      } catch (err) { console.log("__NA__"); }
-    ' "$TMP/audit.json" 2>/dev/null)"
-    if [ "$counted" = "__NA__" ] || [ -z "$counted" ]; then
-      skip "npm audit reports no high or critical findings" "audit produced no parseable report"
-    else
-      check_eq "0" "$counted" "npm audit reports no high or critical findings"
-    fi
-  fi
+  local line
+  while IFS= read -r line; do
+    case "$line" in
+      'ok '*) ok "${line#ok }" ;;
+      'not ok '*) fail "${line#not ok }" ;;
+      *) : ;;
+    esac
+  done <<< "$out"
 }
 
-# ---------------------------------------------------------------------------
-# Section 2 — auth and session
-# ---------------------------------------------------------------------------
+SESSION="$("$NODE_BIN" -e '
+  const crypto = require("crypto");
+  process.stdout.write(
+    crypto.createHmac("sha256", process.argv[1]).update("smart-photo-frame:session:v1").digest("hex"));
+' "$FRAME_KEY")"
 
-COOKIE_NAME=""
+export SPF_SERVER="$SERVER"
+export SPF_FRAME_KEY="$FRAME_KEY"
 
-auth_checks() {
-  section "Authentication and session"
+printf '== smart-photo-frame verification ==\n\n'
 
-  assert_status 200 "/healthz is reachable unauthenticated" /healthz
-  assert_status 401 "/ is 401 without credentials" /
-  assert_status 401 "/api/state is 401 without credentials" /api/state
-  assert_status 401 "/photos/... is 401 without credentials" /photos/family/one.jpg
-  assert_status_in "401 403" "a wrong ?k= is rejected" "/?k=definitely-not-the-frame-key-000000000000"
+# --------------------------------------------------------------------------- #
+# Fixtures
+# --------------------------------------------------------------------------- #
 
-  rm -f "$JAR_MAIN"
-  # ALLOW_QUERY_KEY is unset on this instance, i.e. the shipped default: the key
-  # is accepted once and then redirected away. The opposite mode is exercised on
-  # a dedicated instance in query_key_checks below.
-  assert_status 303 "a correct ?k= returns 303" "/?k=$FRAME_KEY" -c "$JAR_MAIN"
+cat > "$WORK/fake-ha.mjs" <<'FAKEHA'
+import http from 'node:http';
+import fs from 'node:fs';
 
-  local loc
-  loc="$(header_value Location)"
-  case "$loc" in
-    "") fail "the 303 carries a Location header" ;;
-    *\?*) fail "the redirect Location carries no query string" "Location: $loc" ;;
-    *) pass "the redirect Location carries no query string" ;;
-  esac
+const port = Number(process.env.FAKE_HA_PORT);
+const stateFile = process.env.FAKE_HA_STATE;
+const expected = `Bearer ${process.env.FAKE_HA_TOKEN}`;
 
-  check_header 'set-cookie:.*httponly' "the session cookie is HttpOnly"
-  check_header 'set-cookie:.*secure' "the session cookie is Secure"
-  check_header 'set-cookie:.*samesite' "the session cookie sets SameSite"
-  check_header 'set-cookie:.*path=/' "the session cookie is scoped to /"
+const server = http.createServer((req, res) => {
+  const url = new URL(req.url, 'http://127.0.0.1');
+  const match = /^\/api\/states\/(.+)$/.exec(url.pathname);
+  if (!match) {
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end('{"message":"not found"}');
+    return;
+  }
+  if (req.headers.authorization !== expected) {
+    res.writeHead(401, { 'content-type': 'application/json' });
+    res.end('{"message":"unauthorized"}');
+    return;
+  }
+  const entity = decodeURIComponent(match[1]);
+  let states = {};
+  try {
+    states = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+  } catch {
+    states = {};
+  }
+  if (!Object.prototype.hasOwnProperty.call(states, entity)) {
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end('{"message":"Entity not found."}');
+    return;
+  }
+  res.writeHead(200, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({ entity_id: entity, state: String(states[entity]), attributes: {} }));
+});
 
-  COOKIE_NAME="$(header_value Set-Cookie | cut -d= -f1 | tr -d ' ')"
-  case "$COOKIE_NAME" in
-    __Host-*) pass "the session cookie uses the __Host- prefix" ;;
-    *) fail "the session cookie uses the __Host- prefix" "name was '$COOKIE_NAME'" ;;
-  esac
+server.listen(port, '127.0.0.1', () => {
+  process.stdout.write('fake-ha listening\n');
+});
+FAKEHA
 
-  # A cookie jar is mandatory here: without one curl drops the Set-Cookie.
-  assert_status 200 "following the redirect with a cookie jar yields 200" "${loc:-/}" -b "$JAR_MAIN"
-  check_matches '<html' "the redirect target serves the frame page"
+cat > "$WORK/cfg.mjs" <<'CFG'
+import { pathToFileURL } from 'node:url';
 
-  JAR="$JAR_MAIN"
-  assert_status 200 "the cookie authenticates /api/state" /api/state -b "$JAR_MAIN"
-  assert_status 200 "the cookie authenticates /photos/..." /photos/family/one.jpg -b "$JAR_MAIN"
+const { loadConfig } = await import(pathToFileURL(process.env.SPF_SERVER).href);
+const KEY = process.env.SPF_FRAME_KEY;
+const lines = [];
 
-  local bogus="${COOKIE_NAME:-__Host-spf}=%E0%A4%A"
-  assert_status 401 "a cookie with undecodable percent-encoding yields 401" /api/state -H "Cookie: $bogus"
+function check(name, condition, detail = '') {
+  lines.push(condition ? `ok ${name}` : `not ok ${name}: ${detail}`);
 }
 
-# ---------------------------------------------------------------------------
-# Section 3 — response contract
-# ---------------------------------------------------------------------------
-
-contract_checks() {
-  section "Response contract"
-
-  http /healthz
-  check_valid_json "/healthz returns JSON"
-  local key
-  for key in ok ha haVia haLastOk albums photos; do
-    check_key "/healthz exposes $key" "$key"
-  done
-
-  http /api/state -b "$JAR_MAIN"
-  check_valid_json "/api/state returns JSON"
-  for key in album display brightness interval haOk haError haVia haLastOk albums scannedAt; do
-    check_key "/api/state exposes $key" "$key"
-  done
+function env(extra = {}) {
+  return {
+    HA_BASE_URL: 'http://ha.internal:8123/',
+    HA_TOKEN: 'ha-token-value',
+    FRAME_KEY: KEY,
+    ...extra
+  };
 }
 
-# ---------------------------------------------------------------------------
-# Section 4 — rate limiting and proxy trust
-# ---------------------------------------------------------------------------
-
-ratelimit_checks() { # <base url>
-  section "Rate limiting and proxy trust (TRUST_PROXY=1)"
-
-  local saved="$BASE"
-  BASE="$1"
-
-  local clean_ip="203.0.113.200"
-  local bad_ip="203.0.113.7"
-  local other_ip="203.0.113.99"
-
-  rm -f "$JAR_RL"
-  http_ip "$clean_ip" "/?k=$FRAME_KEY" -c "$JAR_RL"
-  check_eq "303" "$HTTP_STATUS" "rate-limit instance issues a session cookie"
-
-  local i unthrottled=0
-  for i in $(seq 1 $((RL_MAX_FAILS + 3))); do
-    http_ip "$bad_ip" /api/state
-    [ "$HTTP_STATUS" = "401" ] && unthrottled=$((unthrottled + 1))
-  done
-  check_ge "$unthrottled" 1 "failed auth returns 401 before the limit"
-
-  http_ip "$bad_ip" /api/state
-  check_eq "429" "$HTTP_STATUS" "the offending forwarded address is throttled"
-
-  http_ip "$other_ip" /api/state
-  check_eq "401" "$HTTP_STATUS" "a different forwarded address still gets 401, not 429"
-
-  http_ip "$bad_ip" /api/state -b "$JAR_RL"
-  check_eq "200" "$HTTP_STATUS" "a cookie holder is served even from the throttled address"
-
-  # A wrong key from a throttled address is still refused outright.
-  http_ip "$bad_ip" "/?k=definitely-not-the-frame-key-000000000000"
-  check_eq "429" "$HTTP_STATUS" "a wrong ?k= from the throttled address stays 429"
-
-  # ...but the correct key is honoured despite the throttle, and clears it. A
-  # client whose cookie does not stick records a failure on every cookieless
-  # request it makes, so it fills its own bucket; checking the throttle before
-  # the key locked the real frame out with the key in its hand. Keep these two
-  # last: a correct key resets the bucket the assertions above depend on.
-  http_ip "$bad_ip" "/?k=$FRAME_KEY"
-  check_eq "303" "$HTTP_STATUS" "the correct ?k= is honoured from a throttled address"
-  http_ip "$bad_ip" /api/state
-  check_eq "401" "$HTTP_STATUS" "a successful key clears that address's failures"
-
-  BASE="$saved"
+function expectThrow(name, overrides, pattern) {
+  try {
+    loadConfig(env(overrides));
+    check(name, false, 'no error thrown');
+  } catch (error) {
+    const message = String(error && error.message);
+    check(name, pattern.test(message), message);
+  }
 }
 
-# ---------------------------------------------------------------------------
-# Section 5 — security headers
-# ---------------------------------------------------------------------------
+const cfg = loadConfig(env());
+check('config: PORT defaults to 3000', cfg.port === 3000, String(cfg.port));
+check('config: HA_POLL_MS defaults to 10000', cfg.haPollMs === 10_000, String(cfg.haPollMs));
+check('config: haTimeoutMs derives to 9000', cfg.haTimeoutMs === 9_000, String(cfg.haTimeoutMs));
+check('config: SCAN_MS defaults to 300000', cfg.scanMs === 300_000, String(cfg.scanMs));
+check('config: HA_REPROBE_EVERY defaults to 30', cfg.haReprobeEvery === 30, String(cfg.haReprobeEvery));
+check('config: MAX_PHOTOS_PER_ALBUM defaults to 5000', cfg.maxPhotosPerAlbum === 5_000, String(cfg.maxPhotosPerAlbum));
+check('config: AUTH_MAX_FAILS defaults to 10', cfg.authMaxFails === 10, String(cfg.authMaxFails));
+check('config: AUTH_WINDOW_MS defaults to 900000', cfg.authWindowMs === 900_000, String(cfg.authWindowMs));
+check('config: PHOTOS_DIR defaults to /photos', cfg.photosDir === '/photos', cfg.photosDir);
+check('config: ALLOW_QUERY_KEY defaults to false', cfg.allowQueryKey === false, String(cfg.allowQueryKey));
+check('config: base URL keeps no trailing slash',
+  cfg.haRoutes[0].base === 'http://ha.internal:8123', cfg.haRoutes[0].base);
+check('config: single primary route by default', cfg.haRoutes.length === 1, String(cfg.haRoutes.length));
+check('config: default album entity', cfg.entities.album === 'input_select.photo_frame_album', cfg.entities.album);
+check('config: default display entity', cfg.entities.display === 'input_boolean.photo_frame_display', cfg.entities.display);
+check('config: session token is 64 hex chars', /^[0-9a-f]{64}$/.test(cfg.sessionToken), cfg.sessionToken);
+check('config: session token is not the frame key', cfg.sessionToken !== KEY, 'token equals key');
 
-header_checks() {
-  section "Security headers"
+check('config: TRUST_PROXY defaults to false', loadConfig(env()).trustProxy === false, 'not false');
+check('config: TRUST_PROXY=1 parses to 1', loadConfig(env({ TRUST_PROXY: '1' })).trustProxy === 1, 'not 1');
+check('config: TRUST_PROXY=true parses to true', loadConfig(env({ TRUST_PROXY: 'true' })).trustProxy === true, 'not true');
+check('config: TRUST_PROXY=false parses to false', loadConfig(env({ TRUST_PROXY: 'false' })).trustProxy === false, 'not false');
+check('config: TRUST_PROXY=loopback passes through',
+  loadConfig(env({ TRUST_PROXY: 'loopback' })).trustProxy === 'loopback', 'not loopback');
 
-  http / -b "$JAR_MAIN"
-  check_header '^x-content-type-options:[[:space:]]*nosniff' "X-Content-Type-Options: nosniff"
-  check_header '^referrer-policy:[[:space:]]*no-referrer' "Referrer-Policy: no-referrer"
-  check_header '^content-security-policy:' "Content-Security-Policy is present"
-  check_header '^content-security-policy:.*frame-ancestors' "CSP includes frame-ancestors"
+const defaultExts = [...loadConfig(env()).imageExtensions].sort().join(',');
+check('config: default image set is the Safari 12 set',
+  defaultExts === '.bmp,.gif,.jpeg,.jpg,.png', defaultExts);
+check('config: default image set excludes .heic', !loadConfig(env()).imageExtensions.has('.heic'), 'heic present');
+check('config: default image set excludes .heif', !loadConfig(env()).imageExtensions.has('.heif'), 'heif present');
+check('config: default image set excludes .webp', !loadConfig(env()).imageExtensions.has('.webp'), 'webp present');
+
+const widened = [...loadConfig(env({ IMAGE_EXTENSIONS: 'jpg, .webp' })).imageExtensions].join(',');
+check('config: IMAGE_EXTENSIONS overrides the default set', widened === '.jpg,.webp', widened);
+expectThrow('config: IMAGE_EXTENSIONS rejects nonsense entries',
+  { IMAGE_EXTENSIONS: '.exe!' }, /IMAGE_EXTENSIONS entries must look like/);
+expectThrow('config: IMAGE_EXTENSIONS rejects an empty list',
+  { IMAGE_EXTENSIONS: ' , , ' }, /at least one extension/);
+
+check('config: HA_POLL_MS=1000 clamps the timeout up to 2000',
+  loadConfig(env({ HA_POLL_MS: '1000' })).haTimeoutMs === 2_000, 'bad clamp');
+check('config: HA_POLL_MS=3600000 clamps the timeout down to 15000',
+  loadConfig(env({ HA_POLL_MS: '3600000' })).haTimeoutMs === 15_000, 'bad clamp');
+
+const dup = loadConfig(env({ HA_BASE_URL_FALLBACK: 'http://ha.internal:8123' }));
+check('config: a duplicate fallback collapses to one route', dup.haRoutes.length === 1, String(dup.haRoutes.length));
+const two = loadConfig(env({ HA_BASE_URL_FALLBACK: 'https://ha.example.net/' }));
+check('config: a distinct fallback adds a second route',
+  two.haRoutes.map((r) => r.name).join(',') === 'primary,fallback', 'bad route list');
+
+try {
+  loadConfig({});
+  check('config: missing required variables are fatal', false, 'no error thrown');
+} catch (error) {
+  check('config: missing required variables are fatal',
+    /missing required environment variable/.test(String(error.message)), String(error.message));
 }
 
-# ---------------------------------------------------------------------------
-# Section 6 — path safety
-# ---------------------------------------------------------------------------
+expectThrow('config: short FRAME_KEY rejected', { FRAME_KEY: 'short' }, /at least 16 characters/);
+expectThrow('config: placeholder FRAME_KEY rejected', { FRAME_KEY: 'changemechangeme' }, /well-known placeholder/);
+expectThrow('config: low-entropy FRAME_KEY rejected', { FRAME_KEY: 'a'.repeat(18) }, /distinct characters/);
+expectThrow('config: FRAME_KEY with a space rejected', { FRAME_KEY: 'key with spaces abc' }, /printable ASCII/);
+expectThrow('config: non-http HA_BASE_URL rejected', { HA_BASE_URL: 'ftp://ha.internal/' }, /http: or https:/);
+expectThrow('config: HA_BASE_URL with credentials rejected',
+  { HA_BASE_URL: 'http://user:pass@ha.internal/' }, /must not embed credentials/);
+expectThrow('config: malformed HA_BASE_URL rejected', { HA_BASE_URL: 'not a url' }, /not a valid absolute URL/);
+expectThrow('config: non-integer PORT rejected', { PORT: '80.5' }, /must be an integer/);
+expectThrow('config: PORT below range rejected', { PORT: '0' }, /must be between 1 and 65535/);
+expectThrow('config: PORT above range rejected', { PORT: '65536' }, /must be between 1 and 65535/);
+expectThrow('config: HA_POLL_MS below range rejected', { HA_POLL_MS: '999' }, /between 1000 and 3600000/);
+expectThrow('config: HA_POLL_MS above range rejected', { HA_POLL_MS: '3600001' }, /between 1000 and 3600000/);
+expectThrow('config: SCAN_MS below range rejected', { SCAN_MS: '4999' }, /between 5000 and 86400000/);
+expectThrow('config: SCAN_MS above range rejected', { SCAN_MS: '86400001' }, /between 5000 and 86400000/);
+expectThrow('config: HA_REPROBE_EVERY below range rejected', { HA_REPROBE_EVERY: '0' }, /between 1 and 10000/);
+expectThrow('config: HA_REPROBE_EVERY above range rejected', { HA_REPROBE_EVERY: '10001' }, /between 1 and 10000/);
+expectThrow('config: MAX_PHOTOS_PER_ALBUM below range rejected',
+  { MAX_PHOTOS_PER_ALBUM: '0' }, /between 1 and 200000/);
+expectThrow('config: MAX_PHOTOS_PER_ALBUM above range rejected',
+  { MAX_PHOTOS_PER_ALBUM: '200001' }, /between 1 and 200000/);
+expectThrow('config: AUTH_MAX_FAILS below range rejected', { AUTH_MAX_FAILS: '0' }, /between 1 and 1000/);
+expectThrow('config: AUTH_MAX_FAILS above range rejected', { AUTH_MAX_FAILS: '1001' }, /between 1 and 1000/);
+expectThrow('config: AUTH_WINDOW_MS below range rejected', { AUTH_WINDOW_MS: '999' }, /between 1000 and 86400000/);
+expectThrow('config: AUTH_WINDOW_MS above range rejected', { AUTH_WINDOW_MS: '86400001' }, /between 1000 and 86400000/);
+expectThrow('config: ALLOW_QUERY_KEY rejects a non-boolean', { ALLOW_QUERY_KEY: 'yes' }, /must be true or false/);
+expectThrow('config: ENTITY_ALBUM must look like an entity id',
+  { ENTITY_ALBUM: 'not-an-entity' }, /domain\.object_id/);
 
-path_checks() {
-  section "Path safety"
+// Documented current behaviour, unchanged by this run: only the first violation
+// is reported, so a second bad value stays hidden behind it.
+expectThrow('config: only the first range violation is reported',
+  { PORT: '0', SCAN_MS: '1' }, /^PORT/);
 
-  local blocked="400 403 404"
+process.stdout.write(`${lines.join('\n')}\n`);
+CFG
 
-  assert_status_in "$blocked" "../ traversal is blocked" \
-    /photos/../secret.txt -b "$JAR_MAIN" --path-as-is
-  check_not_contains "traversal-canary-do-not-serve" "../ traversal leaks no bytes"
+cat > "$WORK/gate.mjs" <<'GATE'
+import { pathToFileURL } from 'node:url';
 
-  assert_status_in "$blocked" "encoded %2e%2e traversal is blocked" \
-    /photos/%2e%2e/secret.txt -b "$JAR_MAIN" --path-as-is
-  check_not_contains "traversal-canary-do-not-serve" "encoded traversal leaks no bytes"
+const { AuthGate } = await import(pathToFileURL(process.env.SPF_SERVER).href);
+const KEY = process.env.SPF_FRAME_KEY;
+const TOKEN = 's'.repeat(64);
+const lines = [];
 
-  assert_status_in "$blocked" "deep traversal is blocked" \
-    /photos/family/../../../../etc/passwd -b "$JAR_MAIN" --path-as-is
-  check_not_contains "root:" "deep traversal leaks no bytes"
-
-  assert_status_in "$blocked" "dotfiles are not served" \
-    /photos/dotty/.secret.jpg -b "$JAR_MAIN" --path-as-is
-
-  assert_status 200 "filenames containing spaces are served" \
-    "/photos/family/a%20photo%20with%20spaces.jpg" -b "$JAR_MAIN"
+function check(name, condition, detail = '') {
+  lines.push(condition ? `ok ${name}` : `not ok ${name}: ${detail}`);
 }
 
-# ---------------------------------------------------------------------------
-# Section 7 — hostile input
-# ---------------------------------------------------------------------------
-
-hostile_checks() {
-  section "Hostile input"
-
-  http /api/state -b "$JAR_MAIN"
-  check_valid_json "/api/state stays valid JSON with hostile album names"
-  check_eq "200" "$HTTP_STATUS" "/api/state answers 200 with hostile album names"
-
-  local family_count
-  family_count="$(jval --count albums family)"
-  check_ge "$family_count" 1 "the scan survives __proto__/constructor/toString albums"
-  check_eq "3" "$family_count" "non-image files are excluded from an album"
-
-  local capped_count
-  capped_count="$(jval --count albums capped)"
-  check_eq "$MAX_PHOTOS" "$capped_count" "an oversized album is capped at MAX_PHOTOS_PER_ALBUM"
-
-  local album
-  album="$(jval album)"
-  check_eq "family" "$album" "hostile album names do not corrupt the selected album"
-
-  assert_status_in "200 400 403 404" "an XSS-shaped album name is handled without a 5xx" \
-    "/photos/%3Cimg%20src%3Dx%20onerror%3Dalert(1)%3E/p.jpg" -b "$JAR_MAIN"
-
-  if [ "$(id -u)" = "0" ]; then
-    skip "an unreadable album does not abort the scan" "running as root, mode 000 is not enforced"
-  else
-    http /api/state -b "$JAR_MAIN"
-    local still
-    still="$(jval --count albums capped)"
-    check_ge "$still" 1 "an unreadable album does not abort the scan"
-  fi
-
-  assert_status 200 "/healthz still healthy after hostile input" /healthz
-  check_eq "true" "$(jval ok)" "/healthz reports ok after hostile input"
+function fakeRes() {
+  return {
+    headers: Object.create(null),
+    statusCode: 200,
+    body: null,
+    location: null,
+    setHeader(name, value) { this.headers[String(name).toLowerCase()] = value; },
+    status(code) { this.statusCode = code; return this; },
+    type() { return this; },
+    send(body) { this.body = body; return this; },
+    redirect(code, target) { this.statusCode = code; this.location = target; return this; }
+  };
 }
 
-# ---------------------------------------------------------------------------
-# Section 8 — Home Assistant propagation
-# ---------------------------------------------------------------------------
-
-behaviour_checks() { # <state file>
-  section "Home Assistant propagation"
-
-  local state="$1"
-  JAR="$JAR_MAIN"
-
-  set_entity "$state" "$ENTITY_ALBUM" "capped"
-  assert_val "album propagates from Home Assistant" "capped" album
-
-  set_entity "$state" "$ENTITY_DISPLAY" "off"
-  assert_val "display off propagates" "off false" display
-
-  set_entity "$state" "$ENTITY_DISPLAY" "on"
-  assert_val "display on propagates" "on true" display
-
-  # Tolerates a server that rescales 0-100 to 0-1.
-  set_entity "$state" "$ENTITY_BRIGHTNESS" "42"
-  assert_val "brightness propagates" "42 0.42" brightness
-
-  # Tolerates a server that converts seconds to milliseconds.
-  set_entity "$state" "$ENTITY_INTERVAL" "25"
-  assert_val "interval propagates" "25 25000" interval
-
-  set_entity "$state" "$ENTITY_ALBUM" "family"
-  assert_val "album reverts on the next poll" "family" album
+function makeGate(extra = {}) {
+  return new AuthGate({
+    sessionToken: TOKEN,
+    frameKey: KEY,
+    maxFails: 2,
+    windowMs: 60_000,
+    openPaths: ['/healthz'],
+    ...extra
+  });
 }
 
-# ---------------------------------------------------------------------------
-# Section 9 — failover and degradation
-# ---------------------------------------------------------------------------
-
-failover_checks() { # <base> <primary port> <primary state> <primary pid> <fallback pid>
-  section "Failover and degradation"
-
-  local saved_base="$BASE" saved_jar="$JAR"
-  BASE="$1"
-  local pport="$2" pstate="$3" ppid="$4" fpid="$5"
-  JAR="$JAR_FO"
-
-  rm -f "$JAR_FO"
-  http "/?k=$FRAME_KEY" -c "$JAR_FO"
-  check_eq "303" "$HTTP_STATUS" "failover instance issues a session cookie"
-
-  assert_val "haVia reports primary while the primary is up" "primary" haVia
-  assert_val "the primary album is in effect" "family" album
-
-  stop_pid "$ppid"
-  assert_val "haVia reports fallback when the primary dies" "fallback" haVia
-  assert_val "the fallback album takes over" "capped" album
-  assert_val "haOk stays true on the fallback" "true" haOk
-
-  stop_pid "$fpid"
-  assert_val "haOk goes false when both endpoints die" "false" haOk
-  http /api/state -b "$JAR_FO"
-  check_eq "capped" "$(jval album)" "the last known album is retained while HA is down"
-  check_key "haError is populated while HA is down" haError
-  assert_status 200 "photos keep being served while HA is down" \
-    /photos/capped/c1.jpg -b "$JAR_FO"
-  assert_status 200 "/healthz stays reachable while HA is down" /healthz
-  check_eq "false" "$(jval ha)" "/healthz reports ha false while HA is down"
-
-  start_stub ha-primary-restart "$pport" "$pstate"
-  wait_http "http://127.0.0.1:$pport/api/" || fail "the primary stub restarts"
-  assert_val "haVia returns to primary once it recovers" "primary" haVia
-  assert_val "the primary album is restored" "family" album
-
-  BASE="$saved_base"
-  JAR="$saved_jar"
+function call(gate, req) {
+  const res = fakeRes();
+  let nexted = false;
+  gate.middleware(req, res, () => { nexted = true; });
+  return { res, nexted };
 }
 
-# ---------------------------------------------------------------------------
-# Section 10 — ALLOW_QUERY_KEY
-# ---------------------------------------------------------------------------
+const request = (path, query = {}, headers = {}, ip = '203.0.113.1') => ({ path, query, headers, ip });
 
-query_key_checks() { # <base url>
-  section "Query-key mode (ALLOW_QUERY_KEY=true)"
-
-  local saved="$BASE"
-  BASE="$1"
-
-  # An iOS home-screen web app cannot inherit Safari's cookie, so its icon URL
-  # carries ?k= on every launch: the key must authenticate the request that
-  # carries it, not a redirect target the app arrives at with nothing.
-  rm -f "$JAR_QK"
-  http "/?k=$FRAME_KEY" -c "$JAR_QK"
-  check_eq "200" "$HTTP_STATUS" "a correct ?k= is served directly, not redirected"
-  check_matches '<html' "the ?k= response is the frame page itself"
-  check_header '^set-cookie:[[:space:]]*__host-' "the ?k= response still sets the session cookie"
-
-  # Every subsequent launch reloads the same URL. It must work whether or not
-  # the cookie from the last launch survived.
-  http "/?k=$FRAME_KEY" -b "$JAR_QK"
-  check_eq "200" "$HTTP_STATUS" "a repeat ?k= launch is served, not redirected"
-  check_matches '<html' "the repeat launch still serves the frame page"
-
-  http "/api/state?k=$FRAME_KEY"
-  check_eq "200" "$HTTP_STATUS" "?k= authenticates /api/state without a redirect hop"
-
-  # The flag relaxes where a valid key is honoured, nothing else.
-  assert_status_in "401 403" "a wrong ?k= is still rejected" \
-    "/?k=definitely-not-the-frame-key-000000000000"
-  assert_status 401 "no credentials are still 401" /api/state
-
-  BASE="$saved"
+{
+  const gate = makeGate();
+  const { res, nexted } = call(gate, request('/album', { k: KEY }, {}, '203.0.113.2'));
+  check('gate: a valid key redirects 303', res.statusCode === 303, String(res.statusCode));
+  check('gate: the redirect keeps the requested path', res.location === '/album', String(res.location));
+  check('gate: a valid key does not fall through', nexted === false, 'next() ran');
+  const cookie = String(res.headers['set-cookie']);
+  check('gate: the cookie is __Host-spf', cookie.startsWith(`__Host-spf=${TOKEN};`), cookie);
+  check('gate: the cookie is HttpOnly', /;\s*HttpOnly/.test(cookie), cookie);
+  check('gate: the cookie is Secure', /;\s*Secure/.test(cookie), cookie);
+  check('gate: the cookie is SameSite=Lax', /;\s*SameSite=Lax/.test(cookie), cookie);
+  check('gate: the cookie is Path=/', /;\s*Path=\//.test(cookie), cookie);
 }
 
-# ---------------------------------------------------------------------------
-# Run
-# ---------------------------------------------------------------------------
+{
+  const gate = makeGate();
+  const a = call(gate, request('//evil.example.com', { k: KEY }, {}, '203.0.113.3'));
+  check('gate: a protocol-relative path collapses to /', a.res.location === '/', String(a.res.location));
+  const b = call(gate, request('/\\evil.example.com', { k: KEY }, {}, '203.0.113.3'));
+  check('gate: a backslash path collapses to /', b.res.location === '/', String(b.res.location));
+}
 
-printf '%ssmart-photo-frame verification harness%s\n' "$C_HDR" "$C_OFF"
-printf 'workspace: %s\n' "$TMP"
+{
+  const gate = makeGate({ allowQueryKey: true });
+  const { res, nexted } = call(gate, request('/api/state', { k: KEY }, {}, '203.0.113.4'));
+  check('gate: ALLOW_QUERY_KEY serves the request directly', nexted === true, 'next() did not run');
+  check('gate: ALLOW_QUERY_KEY does not redirect', res.statusCode === 200, String(res.statusCode));
+  check('gate: ALLOW_QUERY_KEY still issues the cookie',
+    String(res.headers['set-cookie']).includes(TOKEN), 'no cookie');
+}
 
-build_fixtures
-static_checks
+{
+  const gate = makeGate({ maxFails: 1 });
+  const first = call(gate, request('/', {}, {}, '203.0.113.5'));
+  check('gate: no credential is 401', first.res.statusCode === 401, String(first.res.statusCode));
+  const second = call(gate, request('/', {}, {}, '203.0.113.5'));
+  check('gate: the next attempt from the same address is 429',
+    second.res.statusCode === 429, String(second.res.statusCode));
+  check('gate: a 429 carries Retry-After', Boolean(second.res.headers['retry-after']), 'missing header');
+  const other = call(gate, request('/', {}, {}, '203.0.113.6'));
+  check('gate: a different address is unaffected by the bucket',
+    other.res.statusCode === 401, String(other.res.statusCode));
+}
 
-STATE_MAIN="$TMP/ha-main.json"
-STATE_FALLBACK="$TMP/ha-fallback.json"
-write_state_file "$STATE_MAIN" "family"
-write_state_file "$STATE_FALLBACK" "capped"
+{
+  const gate = makeGate({ maxFails: 1 });
+  call(gate, request('/', {}, {}, '203.0.113.7'));
+  const throttled = call(gate, request('/', { k: 'wrong-key-entirely' }, {}, '203.0.113.7'));
+  check('gate: a wrong key from a throttled address is 429',
+    throttled.res.statusCode === 429, String(throttled.res.statusCode));
+  const correct = call(gate, request('/', { k: KEY }, {}, '203.0.113.7'));
+  check('gate: the correct key is honoured from a throttled address',
+    correct.res.statusCode === 303, String(correct.res.statusCode));
+  const after = call(gate, request('/', {}, {}, '203.0.113.7'));
+  check('gate: the correct key clears the failure bucket',
+    after.res.statusCode === 401, String(after.res.statusCode));
+}
+
+{
+  const gate = makeGate();
+  const { res } = call(gate, request('/', {}, { cookie: '__Host-spf=%E0%A4%A' }, '203.0.113.8'));
+  check('gate: a malformed cookie degrades to 401', res.statusCode === 401, String(res.statusCode));
+}
+
+{
+  const gate = makeGate();
+  const { nexted } = call(gate, request('/healthz', { k: 'wrong-but-long-enough' }, {}, '203.0.113.9'));
+  check('gate: /healthz stays open even with a bad key', nexted === true, 'next() did not run');
+}
+
+{
+  const gate = makeGate();
+  const held = call(gate, request('/api/state', {}, { cookie: `__Host-spf=${TOKEN}` }, '203.0.113.10'));
+  check('gate: a valid cookie passes through', held.nexted === true, 'next() did not run');
+  const stripped = call(gate, request('/', { k: KEY }, { cookie: `__Host-spf=${TOKEN}` }, '203.0.113.10'));
+  check('gate: a cookie holder still gets ?k= stripped',
+    stripped.res.statusCode === 303, String(stripped.res.statusCode));
+  const kept = makeGate({ allowQueryKey: true });
+  const notStripped = call(kept, request('/', { k: KEY }, { cookie: `__Host-spf=${TOKEN}` }, '203.0.113.10'));
+  check('gate: ALLOW_QUERY_KEY does not strip for a cookie holder',
+    notStripped.nexted === true, 'next() did not run');
+}
+
+process.stdout.write(`${lines.join('\n')}\n`);
+GATE
+
+cat > "$WORK/library.mjs" <<'LIB'
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+const { PhotoLibrary } = await import(pathToFileURL(process.env.SPF_SERVER).href);
+const lines = [];
+
+function check(name, condition, detail = '') {
+  lines.push(condition ? `ok ${name}` : `not ok ${name}: ${detail}`);
+}
+
+async function tempRoot(tag) {
+  return fs.mkdtemp(path.join(os.tmpdir(), `spf-lib-${tag}-`));
+}
+
+/**
+ * Run a scan with process.stdout captured, so the scanner's own warning lines can
+ * be asserted without racing the harness's own output.
+ */
+async function scanCapturing(library) {
+  const captured = [];
+  const real = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk, encoding, callback) => {
+    captured.push(String(chunk));
+    if (typeof encoding === 'function') encoding();
+    else if (typeof callback === 'function') callback();
+    return true;
+  };
+  try {
+    await library.scan();
+  } finally {
+    process.stdout.write = real;
+  }
+  return captured.join('');
+}
+
+{
+  const root = await tempRoot('scan');
+  await fs.mkdir(path.join(root, 'Trip 2020'));
+  await fs.writeFile(path.join(root, 'Trip 2020', 'b2.jpg'), 'x');
+  await fs.writeFile(path.join(root, 'Trip 2020', 'a1.JPG'), 'x');
+  await fs.writeFile(path.join(root, 'Trip 2020', '.hidden.jpg'), 'x');
+  await fs.writeFile(path.join(root, 'Trip 2020', 'notes.txt'), 'x');
+  await fs.symlink('/etc/passwd', path.join(root, 'Trip 2020', 'escape.jpg'));
+  await fs.mkdir(path.join(root, '.secret'));
+  await fs.mkdir(path.join(root, '__proto__'));
+  await fs.writeFile(path.join(root, 'loose.jpg'), 'x');
+
+  const library = new PhotoLibrary({ root, maxPhotosPerAlbum: 100 });
+  await library.scan();
+  const snap = library.snapshot;
+
+  check('library: a readable root scans ok', snap.ok === true, String(snap.error));
+  check('library: only valid album directories are listed',
+    Object.keys(snap.albums).join(',') === 'Trip 2020', Object.keys(snap.albums).join(','));
+  check('library: dotfiles, non-images and symlinks are skipped',
+    JSON.stringify(snap.albums['Trip 2020']) ===
+      JSON.stringify(['photos/Trip%202020/a1.JPG', 'photos/Trip%202020/b2.jpg']),
+    JSON.stringify(snap.albums['Trip 2020']));
+  check('library: photoCount counts only served files', snap.photoCount === 2, String(snap.photoCount));
+  check('library: __proto__ never becomes an album key',
+    Object.prototype.hasOwnProperty.call(snap.albums, '__proto__') === false, 'present');
+  await fs.rm(root, { recursive: true, force: true });
+}
+
+{
+  const root = await tempRoot('cap');
+  await fs.mkdir(path.join(root, 'Album'));
+  for (const name of ['5.jpg', '3.jpg', '1.jpg', '4.jpg', '2.jpg']) {
+    await fs.writeFile(path.join(root, 'Album', name), 'x');
+  }
+  const library = new PhotoLibrary({ root, maxPhotosPerAlbum: 2 });
+  await library.scan();
+  check('library: the per-album cap keeps a deterministic sorted subset',
+    JSON.stringify(library.snapshot.albums.Album) ===
+      JSON.stringify(['photos/Album/1.jpg', 'photos/Album/2.jpg']),
+    JSON.stringify(library.snapshot.albums.Album));
+  await fs.rm(root, { recursive: true, force: true });
+}
+
+{
+  const missing = path.join(os.tmpdir(), `spf-missing-${process.pid}-${Date.now()}`);
+  const library = new PhotoLibrary({ root: missing, maxPhotosPerAlbum: 10 });
+  await library.scan();
+  const snap = library.snapshot;
+  check('library: an unreadable root reports unhealthy', snap.ok === false, 'reported ok');
+  check('library: an unreadable root explains why',
+    /cannot read PHOTOS_DIR/.test(String(snap.error)), String(snap.error));
+  check('library: an unreadable root counts nothing', snap.albumCount === 0, String(snap.albumCount));
+}
+
+{
+  const root = await tempRoot('heic');
+  await fs.mkdir(path.join(root, 'Holiday'));
+  await fs.writeFile(path.join(root, 'Holiday', 'real.jpg'), 'x');
+  await fs.writeFile(path.join(root, 'Holiday', 'iphone.heic'), 'x');
+  await fs.writeFile(path.join(root, 'Holiday', 'iphone2.HEIF'), 'x');
+  await fs.writeFile(path.join(root, 'Holiday', 'modern.webp'), 'x');
+
+  const library = new PhotoLibrary({ root, maxPhotosPerAlbum: 100 });
+  const output = await scanCapturing(library);
+  const snap = library.snapshot;
+
+  check('library: .heic is not listed',
+    JSON.stringify(snap.albums.Holiday) === JSON.stringify(['photos/Holiday/real.jpg']),
+    JSON.stringify(snap.albums.Holiday));
+  check('library: .heic/.heif/.webp are not counted', snap.photoCount === 1, String(snap.photoCount));
+  check('library: the scanner warns about images it skipped',
+    output.includes('"message":"skipping images the frame cannot display"'), output.slice(0, 200));
+  check('library: the skip warning carries a count',
+    output.includes('"skipped":3'), output.slice(0, 200));
+  check('library: the skip warning is warning level',
+    /"level":"warn"[^\n]*skipping images the frame cannot display/.test(output), 'not warn level');
+
+  const widened = new PhotoLibrary({
+    root,
+    maxPhotosPerAlbum: 100,
+    extensions: new Set(['.jpg', '.webp'])
+  });
+  await widened.scan();
+  check('library: IMAGE_EXTENSIONS can widen the set back to .webp',
+    JSON.stringify(widened.snapshot.albums.Holiday) ===
+      JSON.stringify(['photos/Holiday/modern.webp', 'photos/Holiday/real.jpg']),
+    JSON.stringify(widened.snapshot.albums.Holiday));
+  await fs.rm(root, { recursive: true, force: true });
+}
+
+process.stdout.write(`${lines.join('\n')}\n`);
+LIB
+
+# --------------------------------------------------------------------------- #
+# Section 1 — source sanity
+# --------------------------------------------------------------------------- #
+
+printf -- '-- source --\n'
+
+SERVER_SRC="$(cat "$SERVER")"
+assert_not_contains "source: no console.log in the server" "$SERVER_SRC" "console.log"
+assert_contains "source: /healthz body is liveness only" "$SERVER_SRC" 'res.status(lib.ok ? 200 : 503).json({ ok: lib.ok })'
+assert_contains "source: the trust proxy warning exists" "$SERVER_SRC" "trust proxy disabled"
+assert_contains "source: the default image set is defined once" "$SERVER_SRC" "DEFAULT_IMAGE_EXTENSIONS"
+assert_contains "source: the iOS 12 reasoning is documented" "$SERVER_SRC" "iOS 14"
+
+if "$NODE_BIN" -e '
+  import(process.argv[1]).then((m) => {
+    const required = ["loadConfig", "AuthGate", "HomeAssistantClient", "PhotoLibrary", "createApp", "createPhotoHandler"];
+    const missing = required.filter((k) => typeof m[k] !== "function");
+    if (missing.length > 0) { process.stderr.write(missing.join(",")); process.exit(1); }
+  }).catch((e) => { process.stderr.write(String(e)); process.exit(1); });
+' "$SERVER" 2>/dev/null; then
+  ok "source: server.js imports cleanly and exports its public surface"
+else
+  fail "source: server.js imports cleanly and exports its public surface"
+fi
+
+# --------------------------------------------------------------------------- #
+# Section 2-4 — unit assertions
+# --------------------------------------------------------------------------- #
+
+printf -- '\n-- configuration --\n'
+run_unit "$WORK/cfg.mjs"
+
+printf -- '\n-- auth gate --\n'
+run_unit "$WORK/gate.mjs"
+
+printf -- '\n-- photo library --\n'
+run_unit "$WORK/library.mjs"
+
+# --------------------------------------------------------------------------- #
+# Section 5 — integration run A: TRUST_PROXY=1, real photos, stubbed HA
+# --------------------------------------------------------------------------- #
+
+printf -- '\n-- integration: main run --\n'
+
+PHOTOS_A="$WORK/photos-a"
+mkdir -p "$PHOTOS_A/Trip 2020" "$PHOTOS_A/Family" "$PHOTOS_A/.secret" "$PHOTOS_A/__proto__"
+printf 'jpeg' > "$PHOTOS_A/Trip 2020/a1.jpg"
+printf 'jpeg' > "$PHOTOS_A/Trip 2020/b2.JPG"
+printf 'heic' > "$PHOTOS_A/Trip 2020/nope.heic"
+printf 'text' > "$PHOTOS_A/Trip 2020/notes.txt"
+printf 'jpeg' > "$PHOTOS_A/Trip 2020/.hidden.jpg"
+printf 'png'  > "$PHOTOS_A/Family/one.png"
+printf 'jpeg' > "$PHOTOS_A/.secret/x.jpg"
+printf 'jpeg' > "$PHOTOS_A/__proto__/x.jpg"
+printf 'jpeg' > "$PHOTOS_A/loose.jpg"
 
 HA_PORT="$(free_port)"
-HA_FO_PRIMARY_PORT="$(free_port)"
-HA_FO_FALLBACK_PORT="$(free_port)"
-SRV_PORT="$(free_port)"
-SRV_RL_PORT="$(free_port)"
-SRV_FO_PORT="$(free_port)"
-SRV_QK_PORT="$(free_port)"
+write_ha_state '{"input_select.photo_frame_album":"unavailable","input_boolean.photo_frame_display":"unavailable","input_number.photo_frame_brightness":"unavailable","input_number.photo_frame_interval":"unavailable"}'
 
-start_stub ha-main "$HA_PORT" "$STATE_MAIN"
-wait_http "http://127.0.0.1:$HA_PORT/api/" || fatal "the main Home Assistant stub did not start"
+env -i PATH="$PATH" HOME="${HOME:-/tmp}" \
+  FAKE_HA_PORT="$HA_PORT" FAKE_HA_STATE="$WORK/ha-state.json" FAKE_HA_TOKEN="$HA_TOKEN" \
+  "$NODE_BIN" "$WORK/fake-ha.mjs" > "$WORK/fake-ha.log" 2>&1 &
+HA_PID=$!
+PIDS+=("$HA_PID")
 
-# Main instance: TRUST_PROXY at its shipped default. In that mode the auth
-# limiter shares one bucket across all clients, so the deliberate 401s in the
-# auth section would otherwise throttle every later assertion — hence the
-# deliberately high AUTH_MAX_FAILS here. The limiter is exercised properly on
-# the TRUST_PROXY=1 instance below.
-BASE="http://127.0.0.1:$SRV_PORT"
-start_server srv-main "$SRV_PORT" \
+ha_up=0
+i=0
+while [ "$i" -lt 100 ]; do
+  if grep -q 'fake-ha listening' "$WORK/fake-ha.log" 2>/dev/null; then ha_up=1; break; fi
+  sleep 0.1
+  i=$((i + 1))
+done
+if [ "$ha_up" -eq 1 ]; then ok "harness: stub Home Assistant is listening"; else fail "harness: stub Home Assistant is listening"; fi
+
+PORT_A="$(free_port)"
+LOG_A="$WORK/server-a.log"
+BASE="http://127.0.0.1:$PORT_A"
+
+if start_server "$LOG_A" \
+  PORT="$PORT_A" \
   HA_BASE_URL="http://127.0.0.1:$HA_PORT" \
-  AUTH_MAX_FAILS=1000
-wait_http "$BASE/healthz" || fatal "server.js did not start; log: $(tail -n 5 "$TMP/srv-main.log")"
-JAR="$JAR_MAIN"
-
-auth_checks
-contract_checks
-header_checks
-path_checks
-hostile_checks
-
-start_server srv-rl "$SRV_RL_PORT" \
-  HA_BASE_URL="http://127.0.0.1:$HA_PORT" \
+  HA_TOKEN="$HA_TOKEN" \
+  FRAME_KEY="$FRAME_KEY" \
+  PHOTOS_DIR="$PHOTOS_A" \
   TRUST_PROXY=1 \
-  AUTH_MAX_FAILS="$RL_MAX_FAILS"
-if wait_http "http://127.0.0.1:$SRV_RL_PORT/healthz"; then
-  ratelimit_checks "http://127.0.0.1:$SRV_RL_PORT"
+  HA_POLL_MS=1000 \
+  SCAN_MS=5000 \
+  AUTH_MAX_FAILS=3 \
+  AUTH_WINDOW_MS=60000; then
+  ok "boot: the service starts and logs listening"
+  PID_A="$SERVER_PID"
 else
-  fail "the TRUST_PROXY=1 instance starts" "log: $(tail -n 3 "$TMP/srv-rl.log" | tr '\n' ' ')"
+  fail "boot: the service starts and logs listening" "$(tail -n 5 "$LOG_A" | tr '\n' ' ')"
+  PID_A=""
 fi
 
-# A dedicated instance for the opt-in flag: the main instance must keep proving
-# the shipped default. AUTH_MAX_FAILS is high here for the same reason as the
-# main instance — TRUST_PROXY is unset, so the two deliberate 401s below would
-# otherwise share a bucket with the assertions around them.
-start_server srv-qk "$SRV_QK_PORT" \
+if [ -n "$PID_A" ]; then
+  LOG_TEXT="$(cat "$LOG_A")"
+  assert_contains "boot: the effective trust proxy value is logged" "$LOG_TEXT" '"trustProxy":"1"'
+  assert_contains "boot: the effective ALLOW_QUERY_KEY is logged" "$LOG_TEXT" '"allowQueryKey":false'
+  assert_contains "boot: the effective image set is logged" "$LOG_TEXT" '"imageExtensions":".jpg,.jpeg,.png,.gif,.bmp"'
+  assert_not_contains "boot: no trust proxy warning when TRUST_PROXY=1" "$LOG_TEXT" '"message":"trust proxy disabled"'
+  assert_not_contains "boot: the HA token never reaches the log" "$LOG_TEXT" "$HA_TOKEN"
+  assert_not_contains "boot: the frame key never reaches the log" "$LOG_TEXT" "$FRAME_KEY"
+  assert_contains "boot: logs are structured JSON lines" "$LOG_TEXT" '"level":"info","message":"listening"'
+
+  # ---- /healthz: liveness only -------------------------------------------- #
+  req /healthz
+  assert_eq "healthz: 200 while the photo library is readable" "$CODE" "200"
+  assert_eq "healthz: the body is exactly { ok }" "$BODY" '{"ok":true}'
+  assert_eq "healthz: no other keys are exposed" "$(jkeys "$BODY")" "ok"
+  assert_eq "healthz: ha is gone" "$(jfield ha "$BODY")" "<missing>"
+  assert_eq "healthz: haVia is gone" "$(jfield haVia "$BODY")" "<missing>"
+  assert_eq "healthz: haLastOk is gone" "$(jfield haLastOk "$BODY")" "<missing>"
+  assert_eq "healthz: albums is gone" "$(jfield albums "$BODY")" "<missing>"
+  assert_eq "healthz: photos is gone" "$(jfield photos "$BODY")" "<missing>"
+  assert_matches "healthz: is never cached" "$HEADERS" '^cache-control: *no-store'
+  assert_matches "healthz: carries the security headers" "$HEADERS" '^x-content-type-options: *nosniff'
+
+  req /healthz -I
+  assert_eq "healthz: HEAD is answered too" "$CODE" "200"
+
+  # ---- auth gate over HTTP ------------------------------------------------- #
+  req /
+  assert_eq "auth: an unauthenticated page request is 401" "$CODE" "401"
+  req /api/state
+  assert_eq "auth: an unauthenticated api request is 401" "$CODE" "401"
+  req "/?k=definitely-the-wrong-key"
+  assert_eq "auth: a wrong key is 401" "$CODE" "401"
+
+  req "/?k=$FRAME_KEY"
+  assert_eq "auth: a valid key redirects 303" "$CODE" "303"
+  assert_matches "auth: the redirect target is the bare path" "$HEADERS" '^location: */'
+  assert_contains "auth: the session cookie is issued" "$HEADERS" "__Host-spf=$SESSION"
+  assert_matches "auth: the cookie is HttpOnly, Secure and SameSite=Lax" "$HEADERS" 'httponly; *secure; *samesite=lax'
+
+  req / -X POST
+  assert_eq "method: POST is refused with 405" "$CODE" "405"
+  assert_matches "method: the 405 advertises GET, HEAD" "$HEADERS" '^allow: *GET, HEAD'
+
+  req /api/state -H "Cookie: __Host-spf=$SESSION"
+  assert_eq "state: a cookie holder gets 200" "$CODE" "200"
+  assert_ne "state: haOk is exposed behind the gate" "$(jfield haOk "$BODY")" "<missing>"
+  assert_ne "state: haVia is exposed behind the gate" "$(jfield haVia "$BODY")" "<missing>"
+  assert_ne "state: haLastOk is exposed behind the gate" "$(jfield haLastOk "$BODY")" "<missing>"
+  assert_eq "state: haVia names the primary route" "$(jfield haVia "$BODY")" "primary"
+  assert_ne "state: haError is exposed behind the gate" "$(jfield haError "$BODY")" "<missing>"
+  assert_ne "state: the album catalogue is exposed behind the gate" "$(jfield albums "$BODY")" "<missing>"
+  assert_matches "state: is never cached" "$HEADERS" '^cache-control: *no-store'
+  assert_matches "state: varies on Cookie" "$HEADERS" '^vary: *cookie'
+
+  # ---- catalogue and photo serving ---------------------------------------- #
+  assert_eq "photos: the .heic file is not listed" \
+    "$(jfield 'albums.Trip 2020' "$BODY")" \
+    '["photos/Trip%202020/a1.jpg","photos/Trip%202020/b2.JPG"]'
+  assert_eq "photos: a valid album is listed" "$(jfield 'albums.Family' "$BODY")" '["photos/Family/one.png"]'
+  assert_eq "photos: a dot-prefixed album is not listed" "$(jfield 'albums..secret' "$BODY")" "<missing>"
+  assert_eq "photos: an album named __proto__ is not listed" "$(jfield 'albums.__proto__' "$BODY")" "<missing>"
+
+  req "/photos/Trip%202020/a1.jpg" -H "Cookie: __Host-spf=$SESSION"
+  assert_eq "photos: a supported photo is served" "$CODE" "200"
+  assert_matches "photos: photos are privately cacheable" "$HEADERS" '^cache-control: *private, max-age=3600'
+  req "/photos/Trip%202020/nope.heic" -H "Cookie: __Host-spf=$SESSION"
+  assert_eq "photos: a .heic file is not served" "$CODE" "404"
+  req "/photos/Trip%202020/notes.txt" -H "Cookie: __Host-spf=$SESSION"
+  assert_eq "photos: a non-image file is not served" "$CODE" "404"
+  req "/photos/Trip%202020/a1.jpg"
+  assert_eq "photos: photos require authentication" "$CODE" "401"
+  req "/photos/%2e%2e/%2e%2e/etc/passwd" -H "Cookie: __Host-spf=$SESSION"
+  assert_eq "photos: an encoded traversal is refused" "$CODE" "404"
+  req "/photos/Trip%202020/%2e%2e%2fserver.js" -H "Cookie: __Host-spf=$SESSION"
+  assert_eq "photos: an encoded slash escape is refused" "$CODE" "404"
+  req "/does-not-exist" -H "Cookie: __Host-spf=$SESSION"
+  assert_eq "routing: an unknown path is 404" "$CODE" "404"
+  assert_eq "routing: the 404 body reveals nothing" "$BODY" "Not Found"
+
+  if [ -f "$ROOT/public/index.html" ]; then
+    req / -H "Cookie: __Host-spf=$SESSION"
+    assert_eq "routing: the frame page is served to a cookie holder" "$CODE" "200"
+  fi
+
+  LOG_TEXT="$(cat "$LOG_A")"
+  assert_contains "scan: the skip warning names the event" "$LOG_TEXT" '"message":"skipping images the frame cannot display"'
+  assert_contains "scan: the skip warning carries a count" "$LOG_TEXT" '"skipped":1'
+  assert_contains "scan: the skip warning is warning level" "$LOG_TEXT" '"level":"warn","message":"skipping images the frame cannot display"'
+  assert_contains "scan: an unsupported album name is reported" "$LOG_TEXT" '"message":"skipping album with unsupported name"'
+
+  # ---- change 1: HA health is what was accepted, not what answered --------- #
+  if wait_state haError "no usable entity states" 40; then
+    ok "ha: a poll of nothing but unavailable states is reported as unusable"
+  else
+    fail "ha: a poll of nothing but unavailable states is reported as unusable" "$(state_value haError)"
+  fi
+  req_ip /api/state "$PROBE_IP" -H "Cookie: __Host-spf=$SESSION"
+  assert_eq "ha: haOk stays false when every entity is unavailable" "$(jfield haOk "$BODY")" "false"
+  assert_eq "ha: haLastOk does not advance on an all-unavailable poll" "$(jfield haLastOk "$BODY")" "null"
+  assert_eq "ha: the last known good album survives the bad poll" "$(jfield album "$BODY")" "null"
+  assert_eq "ha: the last known good brightness survives the bad poll" "$(jfield brightness "$BODY")" "100"
+  assert_eq "ha: the last known good interval survives the bad poll" "$(jfield interval "$BODY")" "15"
+
+  write_ha_state '{"input_select.photo_frame_album":"Trip 2020","input_boolean.photo_frame_display":"unavailable","input_number.photo_frame_brightness":"unavailable","input_number.photo_frame_interval":"unavailable"}'
+  if wait_state haOk "true" 40; then
+    ok "ha: a poll mixing usable and unavailable entities still succeeds"
+  else
+    fail "ha: a poll mixing usable and unavailable entities still succeeds" "$(state_value haError)"
+  fi
+  req_ip /api/state "$PROBE_IP" -H "Cookie: __Host-spf=$SESSION"
+  assert_ne "ha: haLastOk advances once something was accepted" "$(jfield haLastOk "$BODY")" "null"
+  assert_eq "ha: the accepted value is applied" "$(jfield album "$BODY")" "Trip 2020"
+  assert_eq "ha: the rejected brightness keeps its previous value" "$(jfield brightness "$BODY")" "100"
+  assert_eq "ha: the rejected display keeps its previous value" "$(jfield display "$BODY")" "true"
+
+  write_ha_state '{"input_select.photo_frame_album":"Family","input_boolean.photo_frame_display":"off","input_number.photo_frame_brightness":"55","input_number.photo_frame_interval":"20"}'
+  if wait_state album "Family" 40; then
+    ok "ha: a fully usable poll applies every entity"
+  else
+    fail "ha: a fully usable poll applies every entity" "$(state_value album)"
+  fi
+  req_ip /api/state "$PROBE_IP" -H "Cookie: __Host-spf=$SESSION"
+  assert_eq "ha: display is applied" "$(jfield display "$BODY")" "false"
+  assert_eq "ha: brightness is applied" "$(jfield brightness "$BODY")" "55"
+  assert_eq "ha: interval is applied" "$(jfield interval "$BODY")" "20"
+  assert_eq "ha: haError clears on a clean poll" "$(jfield haError "$BODY")" "null"
+
+  # ---- change 3: per-client throttling when the proxy is trusted ----------- #
+  ATTACKER="203.0.113.77"
+  BYSTANDER="203.0.113.78"
+  req_ip / "$ATTACKER"
+  assert_eq "limiter: attacker failure 1 is 401" "$CODE" "401"
+  req_ip / "$ATTACKER"
+  assert_eq "limiter: attacker failure 2 is 401" "$CODE" "401"
+  req_ip / "$ATTACKER"
+  assert_eq "limiter: attacker failure 3 is 401" "$CODE" "401"
+  req_ip / "$ATTACKER"
+  assert_eq "limiter: the attacker is throttled with 429" "$CODE" "429"
+  assert_matches "limiter: the 429 carries Retry-After" "$HEADERS" '^retry-after: *[0-9]+'
+  req_ip / "$BYSTANDER"
+  assert_eq "limiter: an unrelated client still gets 401, not 429" "$CODE" "401"
+  req_ip /api/state "$ATTACKER" -H "Cookie: __Host-spf=$SESSION"
+  assert_eq "limiter: a cookie holder on the attacker address is served" "$CODE" "200"
+  req_ip /healthz "$ATTACKER"
+  assert_eq "limiter: liveness stays reachable from a throttled address" "$CODE" "200"
+  LOG_TEXT="$(cat "$LOG_A")"
+  assert_contains "limiter: throttling is logged" "$LOG_TEXT" '"message":"auth throttled"'
+fi
+
+stop_server "${PID_A:-}"
+
+# --------------------------------------------------------------------------- #
+# Section 6 — integration run B: TRUST_PROXY unset, unreadable photo root
+# --------------------------------------------------------------------------- #
+
+printf -- '\n-- integration: trust proxy unset --\n'
+
+PORT_B="$(free_port)"
+LOG_B="$WORK/server-b.log"
+BASE="http://127.0.0.1:$PORT_B"
+
+if start_server "$LOG_B" \
+  PORT="$PORT_B" \
   HA_BASE_URL="http://127.0.0.1:$HA_PORT" \
+  HA_TOKEN="$HA_TOKEN" \
+  FRAME_KEY="$FRAME_KEY" \
+  PHOTOS_DIR="$WORK/no-such-photos-dir" \
+  HA_POLL_MS=1000 \
+  SCAN_MS=5000; then
+  ok "boot: the service starts with TRUST_PROXY unset"
+  PID_B="$SERVER_PID"
+else
+  fail "boot: the service starts with TRUST_PROXY unset" "$(tail -n 5 "$LOG_B" | tr '\n' ' ')"
+  PID_B=""
+fi
+
+if [ -n "$PID_B" ]; then
+  req /healthz
+  req /healthz
+  req /healthz
+  assert_eq "healthz: 503 while the photo library is unreadable" "$CODE" "503"
+  assert_eq "healthz: the 503 body is exactly { ok }" "$BODY" '{"ok":false}'
+  assert_eq "healthz: the 503 exposes no extra keys" "$(jkeys "$BODY")" "ok"
+  assert_eq "healthz: the 503 hides ha" "$(jfield ha "$BODY")" "<missing>"
+  assert_eq "healthz: the 503 hides albums" "$(jfield albums "$BODY")" "<missing>"
+
+  LOG_TEXT="$(cat "$LOG_B")"
+  assert_contains "boot: the trust proxy warning is emitted" "$LOG_TEXT" '"message":"trust proxy disabled"'
+  assert_contains "boot: the warning is warning level" "$LOG_TEXT" '"level":"warn","message":"trust proxy disabled"'
+  assert_contains "boot: the warning names the reverse proxy case" "$LOG_TEXT" "reverse proxy"
+  assert_contains "boot: the warning explains the global bucket" "$LOG_TEXT" "global bucket"
+  assert_contains "boot: the warning states the fix" "$LOG_TEXT" "TRUST_PROXY=1"
+  WARN_COUNT="$(grep -c '"message":"trust proxy disabled"' "$LOG_B" || true)"
+  assert_eq "boot: the warning is emitted exactly once, not per request" "$WARN_COUNT" "1"
+  assert_contains "boot: the effective trust proxy value is logged as false" "$LOG_TEXT" '"trustProxy":"false"'
+fi
+
+stop_server "${PID_B:-}"
+
+# --------------------------------------------------------------------------- #
+# Section 7 — integration run C: ALLOW_QUERY_KEY and a widened image set
+# --------------------------------------------------------------------------- #
+
+printf -- '\n-- integration: query key and widened image set --\n'
+
+PHOTOS_C="$WORK/photos-c"
+mkdir -p "$PHOTOS_C/Web"
+printf 'webp' > "$PHOTOS_C/Web/one.webp"
+printf 'jpeg' > "$PHOTOS_C/Web/two.jpg"
+printf 'heic' > "$PHOTOS_C/Web/three.heic"
+
+PORT_C="$(free_port)"
+LOG_C="$WORK/server-c.log"
+BASE="http://127.0.0.1:$PORT_C"
+
+if start_server "$LOG_C" \
+  PORT="$PORT_C" \
+  HA_BASE_URL="http://127.0.0.1:$HA_PORT" \
+  HA_TOKEN="$HA_TOKEN" \
+  FRAME_KEY="$FRAME_KEY" \
+  PHOTOS_DIR="$PHOTOS_C" \
+  TRUST_PROXY=1 \
   ALLOW_QUERY_KEY=true \
-  AUTH_MAX_FAILS=1000
-if wait_http "http://127.0.0.1:$SRV_QK_PORT/healthz"; then
-  query_key_checks "http://127.0.0.1:$SRV_QK_PORT"
+  IMAGE_EXTENSIONS=".jpg,.webp" \
+  HA_POLL_MS=1000 \
+  SCAN_MS=5000; then
+  ok "boot: the service starts with ALLOW_QUERY_KEY and a custom image set"
+  PID_C="$SERVER_PID"
 else
-  fail "the ALLOW_QUERY_KEY=true instance starts" "log: $(tail -n 3 "$TMP/srv-qk.log" | tr '\n' ' ')"
+  fail "boot: the service starts with ALLOW_QUERY_KEY and a custom image set" "$(tail -n 5 "$LOG_C" | tr '\n' ' ')"
+  PID_C=""
 fi
 
-behaviour_checks "$STATE_MAIN"
+if [ -n "$PID_C" ]; then
+  LOG_TEXT="$(cat "$LOG_C")"
+  assert_contains "boot: the widened image set is logged" "$LOG_TEXT" '"imageExtensions":".jpg,.webp"'
+  assert_contains "boot: ALLOW_QUERY_KEY is logged as true" "$LOG_TEXT" '"allowQueryKey":true'
 
-# Not PPID/CPID: PPID is a readonly bash builtin holding this shell's parent,
-# so the assignment fails while execution continues, and the stale value then
-# gets handed to stop_pid.
-start_stub ha-fo-primary "$HA_FO_PRIMARY_PORT" "$STATE_MAIN"
-HA_FO_PRIMARY_PID="$LAST_PID"
-start_stub ha-fo-fallback "$HA_FO_FALLBACK_PORT" "$STATE_FALLBACK"
-HA_FO_FALLBACK_PID="$LAST_PID"
-wait_http "http://127.0.0.1:$HA_FO_PRIMARY_PORT/api/" || fatal "the failover primary stub did not start"
-wait_http "http://127.0.0.1:$HA_FO_FALLBACK_PORT/api/" || fatal "the failover fallback stub did not start"
+  req "/api/state?k=$FRAME_KEY"
+  assert_eq "query key: a valid key is served directly, not redirected" "$CODE" "200"
+  assert_contains "query key: the cookie is still issued" "$HEADERS" "__Host-spf=$SESSION"
+  assert_eq "query key: the widened set lists .webp" "$(jfield 'albums.Web' "$BODY")" \
+    '["photos/Web/one.webp","photos/Web/two.jpg"]'
+  assert_not_contains "query key: .heic stays out even when the set is widened" "$BODY" "three.heic"
 
-start_server srv-fo "$SRV_FO_PORT" \
-  HA_BASE_URL="http://127.0.0.1:$HA_FO_PRIMARY_PORT" \
-  HA_BASE_URL_FALLBACK="http://127.0.0.1:$HA_FO_FALLBACK_PORT" \
-  AUTH_MAX_FAILS=1000
-if wait_http "http://127.0.0.1:$SRV_FO_PORT/healthz"; then
-  failover_checks "http://127.0.0.1:$SRV_FO_PORT" \
-    "$HA_FO_PRIMARY_PORT" "$STATE_MAIN" "$HA_FO_PRIMARY_PID" "$HA_FO_FALLBACK_PID"
-else
-  fail "the failover instance starts" "log: $(tail -n 3 "$TMP/srv-fo.log" | tr '\n' ' ')"
+  req "/photos/Web/one.webp?k=$FRAME_KEY"
+  assert_eq "photos: a .webp is served when the set allows it" "$CODE" "200"
+  req "/photos/Web/three.heic?k=$FRAME_KEY"
+  assert_eq "photos: a .heic is refused even with a widened set" "$CODE" "404"
+  req "/api/state?k=wrong-key-here"
+  assert_eq "query key: a wrong key is still 401" "$CODE" "401"
+
+  LOG_TEXT="$(cat "$LOG_C")"
+  assert_contains "scan: the widened run still warns about .heic" "$LOG_TEXT" '"message":"skipping images the frame cannot display"'
 fi
 
-# Logs must be structured JSON lines, not plain text.
-section "Logging"
-LOG_LINE="$(grep -m1 '^{' "$TMP/srv-main.log" 2>/dev/null)"
-if [ -n "$LOG_LINE" ]; then
-  HTTP_BODY="$LOG_LINE"
-  check_valid_json "server logs are JSON lines"
-  check_key "log lines carry ts" ts
-  check_key "log lines carry level" level
-  check_key "log lines carry message" message
-else
-  fail "server logs are JSON lines" "no JSON object found in srv-main.log"
-fi
+stop_server "${PID_C:-}"
 
-section "Summary"
-printf '  passed: %d   failed: %d   skipped: %d\n' "$PASS" "$FAIL" "$SKIP"
+# --------------------------------------------------------------------------- #
+# Summary
+# --------------------------------------------------------------------------- #
+
+printf -- '\n----------------------------------------\n'
+printf 'assertions: %d passed, %d failed\n' "$PASS" "$FAIL"
+
 if [ "$FAIL" -gt 0 ]; then
-  printf '\n%sfailures:%s\n' "$C_BAD" "$C_OFF"
-  for label in "${FAILED[@]}"; do printf '  - %s\n' "$label"; done
+  printf '\nlast lines of each server log:\n'
+  for logfile in "$WORK"/server-*.log; do
+    [ -f "$logfile" ] || continue
+    printf -- '--- %s\n' "$(basename "$logfile")"
+    tail -n 20 "$logfile"
+  done
   exit 1
 fi
-printf '%sall checks passed%s\n' "$C_OK" "$C_OFF"
+
 exit 0

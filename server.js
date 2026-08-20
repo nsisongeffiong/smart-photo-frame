@@ -143,7 +143,33 @@ function parseCookies(header) {
 
 const ALBUM_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$/;
 const RESERVED_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
-const IMAGE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.heic', '.heif']);
+
+// Image formats the *target device* can actually decode.
+//
+// The only client this project exists to serve is an iPad Air 1 on iOS 12.5.7,
+// i.e. Safari 12. Mobile Safari has never decoded HEIC or HEIF at all, and WebP
+// support did not arrive until iOS 14. Before this list was trimmed, a .heic or
+// .webp file passed the scan, was counted in /healthz and /api/state, was served
+// with a 200 on request — and rendered as nothing. A photograph that silently
+// never appears is the worst possible failure for a photo frame: there is no
+// error anywhere, the count says it is there, and the wall stays blank for that
+// slot. So the default set is exactly what Safari 12 can paint.
+//
+// Operators running a newer device can widen it explicitly with e.g.
+//   IMAGE_EXTENSIONS=.jpg,.jpeg,.png,.gif,.bmp,.webp
+// Anything outside the effective set is skipped by the scanner *and* refused by
+// the photo handler, and the scanner logs a count of what it skipped so the gap
+// is visible rather than silent.
+const DEFAULT_IMAGE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.bmp']);
+
+// Extensions that look like a photograph somebody meant to display. Used only to
+// decide whether a skipped file is worth warning about: notes.txt is noise, but
+// holiday.heic is a photo the frame will never show.
+const KNOWN_IMAGE_EXTENSIONS = new Set([
+  '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.heic', '.heif',
+  '.avif', '.jxl', '.tif', '.tiff'
+]);
+
 const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f]/;
 const UNAVAILABLE_STATES = new Set(['unknown', 'unavailable', 'none', '']);
 
@@ -167,16 +193,31 @@ function isValidAlbumName(name) {
  * Validate a photo file name.
  *
  * @param {unknown} name Candidate file name (a single path segment).
+ * @param {Set<string>} [extensions] Effective image extension allowlist.
  * @returns {boolean} True when the name is a safe, supported image file name.
  */
-function isValidPhotoName(name) {
+function isValidPhotoName(name, extensions = DEFAULT_IMAGE_EXTENSIONS) {
   if (typeof name !== 'string') return false;
   if (name.length === 0 || name.length > 255) return false;
   if (name.startsWith('.')) return false; // skip dotfiles (S8)
   if (name === '.' || name === '..') return false;
   if (name.includes('/') || name.includes('\\')) return false;
   if (CONTROL_CHARS_RE.test(name)) return false;
-  return IMAGE_EXTENSIONS.has(path.extname(name).toLowerCase());
+  return extensions.has(path.extname(name).toLowerCase());
+}
+
+/**
+ * Test whether a file is an image the effective extension set excludes.
+ *
+ * @param {string} name File name.
+ * @param {Set<string>} extensions Effective image extension allowlist.
+ * @returns {boolean} True when this is a photograph the frame cannot display.
+ */
+function isUndisplayableImageName(name, extensions) {
+  if (typeof name !== 'string') return false;
+  const ext = path.extname(name).toLowerCase();
+  if (ext === '') return false;
+  return KNOWN_IMAGE_EXTENSIONS.has(ext) && !extensions.has(ext);
 }
 
 /**
@@ -205,6 +246,8 @@ function safeRedirectTarget(rawPath) {
 
 const REQUIRED_VARS = ['HA_BASE_URL', 'HA_TOKEN', 'FRAME_KEY'];
 const ENTITY_ID_RE = /^[a-z][a-z0-9_]*\.[a-z0-9_]+$/;
+const EXTENSION_RE = /^\.[a-z0-9]{1,8}$/;
+const MAX_IMAGE_EXTENSIONS = 32;
 const WEAK_KEYS = new Set([
   'changeme', 'change-me', 'changemechangeme', 'password', 'password123',
   'secret', 'frame', 'photoframe', 'smart-photo-frame', 'letmein',
@@ -261,6 +304,43 @@ function readBool(env, name, fallback) {
   if (text === 'true' || text === '1') return true;
   if (text === 'false' || text === '0') return false;
   throw new ConfigError(`${name} must be true or false (or 1/0), got ${JSON.stringify(String(raw).trim())}`);
+}
+
+/**
+ * Read the effective image extension allowlist.
+ *
+ * Defaults to the Safari 12 set (see DEFAULT_IMAGE_EXTENSIONS). Present so an
+ * operator whose frame is a newer device can opt back into .webp — or into
+ * .heic, if they really have a device that decodes it — without editing source.
+ *
+ * @param {NodeJS.ProcessEnv} env Environment.
+ * @param {string} [name] Variable name.
+ * @returns {Set<string>} Lower-case extensions, each with a leading dot.
+ */
+function readImageExtensions(env, name = 'IMAGE_EXTENSIONS') {
+  const raw = env[name];
+  if (raw === undefined || String(raw).trim() === '') return new Set(DEFAULT_IMAGE_EXTENSIONS);
+
+  const parts = String(raw)
+    .split(',')
+    .map((part) => part.trim().toLowerCase())
+    .filter((part) => part !== '');
+  if (parts.length === 0) {
+    throw new ConfigError(`${name} must list at least one extension, e.g. ".jpg,.png"`);
+  }
+
+  const extensions = new Set();
+  for (const part of parts) {
+    const ext = part.startsWith('.') ? part : `.${part}`;
+    if (!EXTENSION_RE.test(ext)) {
+      throw new ConfigError(`${name} entries must look like ".jpg", got ${JSON.stringify(part)}`);
+    }
+    extensions.add(ext);
+  }
+  if (extensions.size > MAX_IMAGE_EXTENSIONS) {
+    throw new ConfigError(`${name} may list at most ${MAX_IMAGE_EXTENSIONS} extensions`);
+  }
+  return extensions;
 }
 
 /**
@@ -329,7 +409,13 @@ function assertStrongFrameKey(key) {
  * safe default (all clients collapse onto the proxy address, so throttling gets
  * stricter) costs frame availability, which this threat model ranks lowest.
  * Deployments behind a reverse proxy MUST set TRUST_PROXY explicitly — normally
- * TRUST_PROXY=1 for exactly one proxy hop. The effective value is logged at boot.
+ * TRUST_PROXY=1 for exactly one proxy hop.
+ *
+ * The default is safe but silent, so main() emits one warning-level line at boot
+ * whenever the effective value is falsy: measured behaviour with TRUST_PROXY
+ * unset behind a proxy is that twelve failed auth attempts from one address
+ * returned 429 to a completely unrelated client, because req.ip is the proxy for
+ * everyone and the limiter collapses into a single global bucket.
  *
  * @param {NodeJS.ProcessEnv} env Environment.
  * @returns {number|boolean|string} Express "trust proxy" setting.
@@ -391,6 +477,7 @@ function readEntityId(env, name, fallback) {
  * @property {number} authWindowMs
  * @property {boolean} allowQueryKey
  * @property {number|boolean|string} trustProxy
+ * @property {Set<string>} imageExtensions
  * @property {EntityMap} entities
  */
 
@@ -454,6 +541,7 @@ export function loadConfig(env = process.env) {
     // this false unless the home-screen web app is actually in use.
     allowQueryKey: readBool(env, 'ALLOW_QUERY_KEY', false),
     trustProxy: readTrustProxy(env),
+    imageExtensions: readImageExtensions(env),
     entities: {
       album: readEntityId(env, 'ENTITY_ALBUM', 'input_select.photo_frame_album'),
       display: readEntityId(env, 'ENTITY_DISPLAY', 'input_boolean.photo_frame_display'),
@@ -875,10 +963,18 @@ export class HomeAssistantClient {
           this.#activeIndex = index;
         }
 
-        // Reachability is not health. Four 401s prove HA answered, but yielded no
-        // usable state, so haOk and haLastOk must not claim a good poll. The route
-        // still counts as reachable so a bad token cannot cause route flapping.
-        const usable = Object.keys(outcome.values).length > 0;
+        // Reachability is not health, and neither is a 200. Four 401s prove HA
+        // answered but yielded nothing; so does a 200 carrying "unavailable",
+        // which #applyValues rejects outright. Counting *fetched* keys therefore
+        // reported a perfectly healthy Home Assistant while no state at all was
+        // being applied — haOk true, haLastOk advancing, frame frozen. Health is
+        // now the number of values actually accepted into last known good state:
+        // a poll in which nothing was accepted is not a successful poll.
+        //
+        // The route still counts as reachable either way, so a bad token or a
+        // temporarily unavailable entity cannot cause route flapping.
+        const accepted = this.#applyValues(outcome.values);
+        const usable = accepted > 0;
         this.#haOk = usable;
         if (outcome.problems.length > 0) {
           this.#haError = outcome.problems.join('; ');
@@ -888,10 +984,11 @@ export class HomeAssistantClient {
 
         if (usable) {
           this.#lastOkAt = Date.now();
-          this.#applyValues(outcome.values);
         } else if (wasOk) {
           log('warn', 'ha reachable but returned no usable state', {
             route: route.name,
+            fetched: Object.keys(outcome.values).length,
+            accepted,
             detail: this.#haError
           });
         }
@@ -1019,32 +1116,46 @@ export class HomeAssistantClient {
    * Merge freshly polled entity states into the last known good state.
    *
    * Unparseable, unknown or unavailable values keep the previous value rather
-   * than blanking the frame.
+   * than blanking the frame. The count of values actually taken is returned
+   * because it, not the count of HTTP 200s, is what "Home Assistant is healthy"
+   * means for this service: four 200s carrying "unavailable" change nothing.
    *
    * @param {Record<string, string>} values Raw entity states, keyed by role.
-   * @returns {void}
+   * @returns {number} How many roles were accepted into last known good state.
    */
   #applyValues(values) {
+    let accepted = 0;
+
     const album = typeof values.album === 'string' ? values.album.trim() : null;
     if (album !== null && !UNAVAILABLE_STATES.has(album.toLowerCase()) && isValidAlbumName(album)) {
       this.#values.album = album;
+      accepted += 1;
     }
 
     if (typeof values.display === 'string') {
       const display = values.display.trim().toLowerCase();
-      if (display === 'on') this.#values.display = true;
-      else if (display === 'off') this.#values.display = false;
+      if (display === 'on') {
+        this.#values.display = true;
+        accepted += 1;
+      } else if (display === 'off') {
+        this.#values.display = false;
+        accepted += 1;
+      }
     }
 
     const brightness = parseFiniteState(values.brightness);
     if (brightness !== null) {
       this.#values.brightness = clamp(Math.round(brightness), 10, 100);
+      accepted += 1;
     }
 
     const interval = parseFiniteState(values.interval);
     if (interval !== null) {
       this.#values.interval = clamp(Math.round(interval), 1, 3600);
+      accepted += 1;
     }
+
+    return accepted;
   }
 }
 
@@ -1065,6 +1176,7 @@ const HARD_ALBUM_SCAN_LIMIT = 200_000;
 export class PhotoLibrary {
   #root;
   #maxPerAlbum;
+  #extensions;
   #maxAlbums = 512;
   /** @type {Record<string, string[]>} */
   #albums = Object.create(null); // null prototype: keys come from the filesystem (S6)
@@ -1080,10 +1192,14 @@ export class PhotoLibrary {
    * @param {Object} options Library options.
    * @param {string} options.root Realpath-resolved photo root.
    * @param {number} options.maxPhotosPerAlbum Hard cap on files per album (S8).
+   * @param {Set<string>} [options.extensions] Effective image extension allowlist.
    */
-  constructor({ root, maxPhotosPerAlbum }) {
+  constructor({ root, maxPhotosPerAlbum, extensions }) {
     this.#root = root;
     this.#maxPerAlbum = maxPhotosPerAlbum;
+    this.#extensions = extensions instanceof Set && extensions.size > 0
+      ? new Set(extensions)
+      : new Set(DEFAULT_IMAGE_EXTENSIONS);
   }
 
   /**
@@ -1169,7 +1285,10 @@ export class PhotoLibrary {
 
     /** @type {string[]} */
     const names = [];
+    /** @type {Map<string, number>} */
+    const undisplayable = new Map();
     let truncated = false;
+
     for (const entry of entries) {
       if (names.length >= HARD_ALBUM_SCAN_LIMIT) {
         truncated = true;
@@ -1177,11 +1296,31 @@ export class PhotoLibrary {
       }
       if (entry.name.startsWith('.')) continue;
       if (entry.isSymbolicLink() || !entry.isFile()) continue;
-      if (!isValidPhotoName(entry.name)) continue;
+      if (!isValidPhotoName(entry.name, this.#extensions)) {
+        // A .heic or .webp here is somebody's photograph that will never appear
+        // on an iOS 12 frame. Count it so the omission shows up in the log
+        // instead of being an invisible hole in the slideshow.
+        if (isUndisplayableImageName(entry.name, this.#extensions)) {
+          const ext = path.extname(entry.name).toLowerCase();
+          undisplayable.set(ext, (undisplayable.get(ext) ?? 0) + 1);
+        }
+        continue;
+      }
       if (!isInside(this.#root, path.join(dir, entry.name))) continue; // defence in depth
       names.push(entry.name);
     }
     if (truncated) log('warn', 'album scan hard limit reached', { album, limit: HARD_ALBUM_SCAN_LIMIT });
+
+    if (undisplayable.size > 0) {
+      let skipped = 0;
+      for (const count of undisplayable.values()) skipped += count;
+      log('warn', 'skipping images the frame cannot display', {
+        album,
+        skipped,
+        formats: [...undisplayable.keys()].sort().join(','),
+        allowed: [...this.#extensions].join(',')
+      });
+    }
 
     // Sort *before* capping. Capping raw readdir order would make the selected
     // subset depend on filesystem enumeration order, so an over-cap album could
@@ -1257,16 +1396,19 @@ function securityHeaders(req, res, next) {
  * album/file names are revalidated and symlink escapes are caught by realpath.
  *
  * @param {string} root Realpath-resolved photo root.
+ * @param {Set<string>} [extensions] Effective image extension allowlist. A format
+ *   the scanner refuses to list must also be refused here, or a stale client
+ *   playlist could still request an undecodable file.
  * @returns {import('express').RequestHandler} Handler for GET /photos/*.
  */
-export function createPhotoHandler(root) {
+export function createPhotoHandler(root, extensions = DEFAULT_IMAGE_EXTENSIONS) {
   return async function servePhoto(req, res, next) {
     const relative = typeof req.params[0] === 'string' ? req.params[0] : '';
     const segments = relative.split('/').filter((segment) => segment.length > 0);
     if (segments.length !== 2) return res.status(404).type('text/plain').send('Not Found\n');
 
     const [album, file] = segments;
-    if (!isValidAlbumName(album) || !isValidPhotoName(file)) {
+    if (!isValidAlbumName(album) || !isValidPhotoName(file, extensions)) {
       return res.status(404).type('text/plain').send('Not Found\n');
     }
 
@@ -1315,7 +1457,9 @@ export function createApp({ config, ha, library, gate, photosRoot }) {
   // X-Forwarded-For is honoured only when TRUST_PROXY is set explicitly (normally
   // TRUST_PROXY=1 for the single reverse proxy in front). The default of false
   // keeps per-IP throttling keyed on the socket address, so a client-supplied
-  // header can never influence it (S3).
+  // header can never influence it (S3). main() warns at boot when it is falsy,
+  // because the failure mode behind a proxy — one global throttle bucket — is
+  // otherwise invisible until a stranger's 429 blanks the frame.
   app.set('trust proxy', config.trustProxy);
   app.set('query parser', 'simple');
 
@@ -1328,19 +1472,24 @@ export function createApp({ config, ha, library, gate, photosRoot }) {
     return res.status(405).type('text/plain').send('Method Not Allowed\n');
   });
 
-  // Unauthenticated: polled by Uptime Kuma. Counts only, no state detail.
+  // Unauthenticated liveness probe, and nothing more.
+  //
+  // This is the only endpoint in front of the auth gate, so anyone who can reach
+  // the hostname can read whatever it returns. It used to return ha, haVia,
+  // haLastOk, albums and photos: none of those is a credential, but together they
+  // tell a stranger whether the home automation system is answering, when it last
+  // was (a presence signal for a house), whether the tailnet is down — haVia
+  // flipping to "fallback" announces exactly that — and how large the photo
+  // library is. The body is therefore liveness only.
+  //
+  // The status semantics are unchanged, because the container HEALTHCHECK reads
+  // statusCode and nothing else: 200 when the photo library scanned, 503 when it
+  // did not. The detail is not lost — /api/state returns haOk, haVia and haLastOk
+  // behind the gate, so monitoring points at an authenticated URL instead.
   app.get('/healthz', (req, res) => {
-    const ha_ = ha.snapshot;
     const lib = library.snapshot;
     res.setHeader('Cache-Control', 'no-store');
-    res.status(lib.ok ? 200 : 503).json({
-      ok: lib.ok,
-      ha: ha_.haOk,
-      haVia: ha_.haVia,
-      haLastOk: ha_.haLastOk,
-      albums: lib.albumCount,
-      photos: lib.photoCount
-    });
+    res.status(lib.ok ? 200 : 503).json({ ok: lib.ok });
   });
 
   app.use(gate.middleware);
@@ -1364,7 +1513,7 @@ export function createApp({ config, ha, library, gate, photosRoot }) {
     });
   });
 
-  app.get('/photos/*', createPhotoHandler(photosRoot));
+  app.get('/photos/*', createPhotoHandler(photosRoot, config.imageExtensions));
 
   // The client page is produced by a later run; the directory is served as-is
   // and a missing index.html is simply a 404.
@@ -1438,6 +1587,34 @@ function startLoop(task, intervalMs, name) {
 }
 
 /**
+ * Warn once, at boot, when X-Forwarded-For is not trusted.
+ *
+ * false is the correct default for a directly exposed service: trusting the
+ * header with no proxy in front lets any client name its own address and evade
+ * the auth limiter entirely. What was missing is any way to notice the setting is
+ * wrong. Measured behaviour with TRUST_PROXY unset behind a proxy: twelve failed
+ * auth attempts from one address returned 429 to a completely unrelated client,
+ * because req.ip is the proxy for everybody and the limiter collapses to a single
+ * global bucket. With TRUST_PROXY=1 the same test correctly returns 429 to the
+ * attacker, 401 to a bystander and 200 to a cookie holder on the attacker's
+ * address. One line at startup — not per request — makes that visible.
+ *
+ * @param {number|boolean|string} trustProxy Effective express "trust proxy" value.
+ * @returns {void}
+ */
+function warnIfProxyUntrusted(trustProxy) {
+  if (trustProxy) return;
+  log('warn', 'trust proxy disabled', {
+    trustProxy: String(trustProxy),
+    detail:
+      'X-Forwarded-For is ignored, so req.ip is the socket peer. If this service sits behind a reverse proxy '
+      + 'that peer is the proxy for every client and the auth failure limiter becomes one global bucket rather '
+      + 'than per-client: one attacker can 429 the frame and everybody else. Set TRUST_PROXY=1 when exactly one '
+      + 'proxy is in front, or leave this unset only if the service is exposed directly.'
+  });
+}
+
+/**
  * Start the service.
  *
  * @returns {Promise<void>} Resolves once the HTTP server is listening.
@@ -1455,11 +1632,17 @@ async function main() {
     throw error;
   }
 
+  warnIfProxyUntrusted(config.trustProxy);
+
   // Resolve the root once so symlinked mounts (/photos -> /mnt/photos) still
   // pass every containment check.
   const photosRoot = await fs.realpath(config.photosDir).catch(() => config.photosDir);
 
-  const library = new PhotoLibrary({ root: photosRoot, maxPhotosPerAlbum: config.maxPhotosPerAlbum });
+  const library = new PhotoLibrary({
+    root: photosRoot,
+    maxPhotosPerAlbum: config.maxPhotosPerAlbum,
+    extensions: config.imageExtensions
+  });
   const ha = new HomeAssistantClient({
     routes: config.haRoutes,
     token: config.haToken,
@@ -1496,7 +1679,10 @@ async function main() {
       trustProxy: String(config.trustProxy),
       // Also logged explicitly: when true the frame key is expected to live in
       // the URL of every request, and it will be visible in proxy access logs.
-      allowQueryKey: config.allowQueryKey
+      allowQueryKey: config.allowQueryKey,
+      // And the effective image formats, because anything outside this list is
+      // skipped by the scanner and 404'd by the photo handler.
+      imageExtensions: [...config.imageExtensions].join(',')
     });
   });
 
