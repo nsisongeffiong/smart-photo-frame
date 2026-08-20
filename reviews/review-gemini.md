@@ -1,26 +1,11 @@
 ## FINDINGS
 
-**[SEVERITY: Medium] [CONFIDENCE: High]**  
-**Category:** Logic Bug / Incorrect State & Health Reporting  
-**Location:** `server.js`, `HomeAssistantClient.poll()` (~line 580) and `#applyValues()` (~line 625)  
-**What:** `HomeAssistantClient.poll()` evaluates Home Assistant health by checking `usable = Object.keys(outcome.values).length > 0`. When Home Assistant is starting up or has entities in state `"unknown"` or `"unavailable"`, `#fetchState()` returns HTTP 200 with those state strings. Because `outcome.values` receives these keys, `poll()` sets `haOk = true` and updates `lastOkAt = Date.now()`. However, `#applyValues()` rejects `"unknown"` and `"unavailable"` states, so no state variables in `#values` are updated. As a result, `/healthz` and `/api/state` report Home Assistant as healthy (`haOk: true`) and advance the timestamp despite receiving no usable values.  
-**Fix:** Modify `#applyValues()` to return the count of accepted valid values, and derive `haOk` / `usable` from whether at least one value was accepted:
-```javascript
-const accepted = this.#applyValues(outcome.values);
-const usable = accepted > 0;
-this.#haOk = usable;
-if (usable) {
-  this.#lastOkAt = Date.now();
-}
-```
-
----
-
-**[SEVERITY: Medium] [CONFIDENCE: High]**  
-**Category:** Logic Bug / Race Condition / Data Leakage  
+**[SEVERITY: Medium] [CONFIDENCE: High]**
+**Category:** Logic Bug / Race Condition / UI State Corruption  
 **Location:** `public/index.html`, `ensurePlaylist()` (~line 917)  
-**What:** When an album selection changes, `ensurePlaylist()` updates `app.playlist` and resets the playlist signature, but fails to increment `app.loadToken`. If an image request from the *previous* album was in-flight when the album changed, its `whenSettled` completion callback compares its captured token against `app.loadToken`. Because `app.loadToken` was not incremented, the check passes, and `onPhotoReady()` displays the old album's photo on screen despite the selection change.  
-**Fix:** Increment `app.loadToken++` inside `ensurePlaylist()` whenever a new playlist signature is established:
+**What:** Changing albums does not invalidate in-flight image requests. When Home Assistant changes the selected album, `applySettings()` calls `ensurePlaylist()` to switch playlists. `ensurePlaylist()` resets `app.playlist` and `app.playIndex`, but fails to increment `app.loadToken`. If an image request from the *previous* album was in-flight when the selection changed, its completion callback compares its captured `token` against `app.loadToken`. Because `app.loadToken` was not incremented, `token === app.loadToken` evaluates to `true`. When the old image finishes loading, `onPhotoReady()` renders the photo from the old album on screen and reschedules the photo timer, cancelling the pending transition to the newly selected album.  
+**Attack path:** An operator changes the active album in Home Assistant while a photo from the old album is loading over a slow connection. The frame displays the old album's photo and stays stuck on it for the full slide interval (e.g. 45 seconds).  
+**Fix:** Increment `app.loadToken++` inside `ensurePlaylist()` whenever the playlist signature changes:
 ```javascript
 if (sig === app.playlistSig) { return false; }
 
@@ -31,37 +16,50 @@ app.playlistSig = sig;
 ---
 
 **[SEVERITY: Medium] [CONFIDENCE: High]**  
-**Category:** Logic Bug / Bash Special Variable Violation & Process Leak  
-**Location:** `verify.sh` (~line 700)  
-**What:** `verify.sh` assigns command substitution output to `PPID` (`PPID="$(start_stub ...)"`). `PPID` is a readonly environment variable in Bash. Attempting to assign to `PPID` causes Bash to abort with `PPID: readonly variable`. Furthermore, invoking `start_stub` via command substitution runs it inside a subshell, losing array modifications to `PIDS+=("$pid")`. Consequently, background Home Assistant stub processes leak when the harness exits.  
-**Fix:** Use explicit variable names (e.g. `HA_PRIMARY_PID`) and invoke `start_stub` directly without subshell command substitution:
-```bash
-LAST_PID=""
-start_stub() {
-  local name="$1" port="$2" state="$3"
-  node "$TMP/ha-stub.js" "$port" "$state" >"$TMP/$name.log" 2>&1 &
-  LAST_PID=$!
-  PIDS+=("$LAST_PID")
-}
-
-start_stub ha-fo-primary "$HA_FO_PRIMARY_PORT" "$STATE_MAIN"
-HA_PRIMARY_PID="$LAST_PID"
+**Category:** Deployment Logic / Configuration Bypassed  
+**Location:** `docker-compose.yaml`, `environment` block (~line 14)  
+**What:** `docker-compose.yaml` omits `ALLOW_QUERY_KEY` from the service environment block. Under Docker Compose, environment variables defined in `.env` are only passed into the container if explicitly declared in `docker-compose.yaml`'s `environment:` section (or imported via `env_file:`). Consequently, setting `ALLOW_QUERY_KEY=true` in `.env` as documented in `.env.example` and `README.md` is silently ignored during Compose deployments, leaving `ALLOW_QUERY_KEY=false` inside the container.  
+**Attack path:** An operator follows the README to configure an iOS Home Screen web app by setting `ALLOW_QUERY_KEY=true` in `.env` and deploying via Docker Compose. Compose drops the variable, so `server.js` redirects the web app to a bare path without the key, causing 401 failures on launch.  
+**Fix:** Pass `ALLOW_QUERY_KEY` in `docker-compose.yaml`:
+```yaml
+      AUTH_MAX_FAILS: "${AUTH_MAX_FAILS:-10}"
+      AUTH_WINDOW_MS: "${AUTH_WINDOW_MS:-60000}"
+      ALLOW_QUERY_KEY: "${ALLOW_QUERY_KEY:-false}"
 ```
 
 ---
 
 **[SEVERITY: Low] [CONFIDENCE: High]**  
-**Category:** Syntax Error / Build & Tooling Failure  
-**Location:** `src/generated.py`  
-**What:** `src/generated.py` contains raw Markdown text (`## Verdict...`) instead of valid Python code. Any build step, packaging tool, test runner, or linter that parses or compiles the `src/` directory (such as `python -m compileall src`) will fail with a `SyntaxError`.  
-**Fix:** Delete `src/generated.py` or move it to a non-code documentation directory.
+**Category:** Race Condition / Out-of-Order State Synchronization  
+**Location:** `public/index.html`, `poll()` (~line 704)  
+**What:** `poll()` issues `XMLHttpRequest` state checks to `/api/state` without request sequence tracking. Polls are triggered both periodically (every 15s) and on page visibility events (`visibilitychange`, `pageshow`). If a visibility-triggered poll completes faster than a delayed background poll, the older request resolving later overwrites `app.state` with stale data. Furthermore, an expired/timed-out earlier poll will invoke `onPollError()`, artificially incrementing `app.bridgeFailures` and potentially triggering fallback schedule mode even though a more recent poll succeeded.  
+**Fix:** Track poll request sequence numbers and ignore completions or errors from requests older than the latest completed request:
+```javascript
+var pollSeq = 0;
+var lastCompletedPollSeq = 0;
+
+function poll() {
+  var seq = ++pollSeq;
+  var settled = false;
+  var xhr = new XMLHttpRequest();
+  // ...
+  function complete(cb) {
+    if (settled) { return; }
+    settled = true;
+    if (seq < lastCompletedPollSeq) { return; }
+    lastCompletedPollSeq = seq;
+    cb();
+  }
+  // Use complete() in onreadystatechange, ontimeout, and onerror handlers
+}
+```
 
 ---
 
 **[SEVERITY: Low] [CONFIDENCE: High]**  
-**Category:** Error Handling / Correctness  
+**Category:** Error Handling / Logging Correctness  
 **Location:** `server.js`, `main()` (~line 1054)  
-**What:** `main()` calls `app.listen(config.port)` asynchronously. If socket binding fails (e.g., `EADDRINUSE` or `EACCES`), Express emits an `'error'` event on the server object. Because `main()` neither awaits the listening state nor registers an `'error'` event listener on the server instance, the failure triggers an unhandled EventEmitter error, bypassing structured fatal logging (`log('error', 'fatal', ...)`).  
+**What:** `main()` calls `app.listen(config.port)` asynchronously without awaiting server socket binding or listening for `'error'` events on the returned `http.Server` instance. If port binding fails (e.g. `EADDRINUSE` or `EACCES`), Express emits an `'error'` event asynchronously. Because `main()` resolves immediately after `app.listen()` returns, the error is not caught by `main().catch()`. Instead, Node.js treats the unhandled `'error'` event as an unhandled exception, dumping a raw stack trace to stderr and bypassing structured JSON fatal logging (`log('error', 'fatal', ...)`).  
 **Fix:** Await a Promise that listens for both `'listening'` and `'error'` events:
 ```javascript
 const server = app.listen(config.port);
@@ -75,31 +73,9 @@ await new Promise((resolve, reject) => {
 
 ---
 
-**[SEVERITY: Low] [CONFIDENCE: High]**  
-**Category:** Race Condition / Out-of-Order State Synchronization  
-**Location:** `public/index.html`, `poll()` (~line 704)  
-**What:** `poll()` issues `XMLHttpRequest` calls without sequence tracking. If a poll triggered by `visibilitychange` or `pageshow` resolves faster than an earlier scheduled poll, the older request resolving later will overwrite `app.state` with stale state data.  
-**Fix:** Assign a monotonic sequence ID to each poll request and ignore responses arriving out of order:
-```javascript
-var pollSeq = 0;
-var lastAppliedSeq = 0;
-
-function poll() {
-  var seq = ++pollSeq;
-  // ...
-  if (xhr.status >= 200 && xhr.status < 300) {
-    if (seq < lastAppliedSeq) { return; }
-    lastAppliedSeq = seq;
-    onState(data);
-  }
-}
-```
-
----
-
 ## CHAINED ATTACK PATHS
 
-No multi-step attack chains identified. Individual security controls (auth cookie verification with `__Host-` prefix, constant-time token comparison via `crypto.timingSafeEqual`, open-redirect sanitization in `safeRedirectTarget`, symlink containment via `fs.realpath` and `isInside`, strict object key validation avoiding prototype pollution, and per-IP auth rate limiting) are robustly implemented.
+No multi-step attack chains identified. Security controls (auth cookie validation with `__Host-` prefix, timing-safe key comparisons, path traversal checks via `realpath` and `isInside()`, Strict CSP without unsafe-eval, strict null-prototype object maps for filesystem keys, and per-IP auth rate limiting) are effectively implemented.
 
 ---
 
@@ -117,5 +93,5 @@ No multi-step attack chains identified. Individual security controls (auth cooki
 ## CORRECTNESS ISSUES
 
 1. **Location:** `scripts/run.py` (line 38)  
-   **What:** Executing `subprocess.run` with `VENV_PYTHON` will raise an unhandled `OSError` (e.g. `FileNotFoundError`) if the virtual environment binary is missing or non-executable, printing an unhandled Python traceback.  
-   **Fix:** Wrap the `subprocess.run` invocation in a `try...except OSError` block and exit gracefully with a clear error message.
+   **What:** Executing `subprocess.run` with `VENV_PYTHON` raises an unhandled `OSError` (e.g. `FileNotFoundError`) if the virtual environment binary is missing or non-executable, printing a raw Python traceback.  
+   **Fix:** Wrap the `subprocess.run` call in a `try...except OSError:` block, print a clean error message to stderr, and exit with status 1.

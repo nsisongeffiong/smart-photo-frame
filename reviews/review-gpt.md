@@ -1,192 +1,158 @@
 ## Documentation Gaps
 
-No exported functions or classes lack adequate API documentation.
+No exported function or class lacks an adequate docstring. `loadConfig`, `AuthGate`, `HomeAssistantClient`, `PhotoLibrary`, `createPhotoHandler`, and `createApp` document parameters, return values, and relevant behavior.
 
-- `loadConfig`, `AuthGate`, `HomeAssistantClient`, `PhotoLibrary`, `createPhotoHandler`, and `createApp` have adequate JSDoc.
-- `scripts/run.py` exposes no reusable public API.
+Non-API documentation gaps that affect operation:
 
-The top-level `README.md` is operationally incomplete—it omits configuration, authentication bootstrap, album layout, and deployment instructions—but this is not a public API docstring gap.
+- **`.env.example` / configuration reference** — `IMAGE_EXTENSIONS` is undocumented despite being read by `server.js`. This also makes the statement that every server variable is listed inaccurate.
+- **`README.md` / `/healthz`** — documents a detailed health payload, while the implementation returns only `{"ok": boolean}`.
+- **`README.md` / Photos** — says `.webp`, `.heic`, and `.heif` are accepted by default, but the server now excludes them unless `IMAGE_EXTENSIONS` is overridden.
+- **`README.md` / `verify.sh`** — describes failover, browser compatibility, query-key, and other checks that the current harness does not perform.
+- **`README.md` / Deployment** — describes a named `photos` volume, while Compose uses a host bind mount controlled by `PHOTOS_HOST_DIR`.
 
 ## Code Quality Issues
 
-### Correctness
+### Correctness and security
 
-- [server.js:~580] `HomeAssistantClient.poll()` treats every successfully fetched state string as usable. Values such as `unknown`, `unavailable`, or invalid numbers populate `outcome.values`, causing `haOk=true` and advancing `haLastOk` even though `#applyValues()` accepts nothing. Suggested fix: make `#applyValues()` return an accepted-value count and derive health from that count.
+- [server.js:~330] `IMAGE_EXTENSIONS` accepts any alphanumeric extension, including `.html`, `.js`, or `.svg`. Such files can be served from the authenticated same-origin `/photos` route; an HTML file would receive an executable MIME type under a CSP that permits inline scripts. Suggested fix: restrict overrides to a defined set of passive image formats rather than validating syntax alone.
 
-- [public/index.html:~917] `ensurePlaylist()` does not invalidate a photo already loading from the previous album. Its callback can pass the `loadToken` check and display an old-album photo after the selection changes. Suggested fix: increment `app.loadToken` immediately when the playlist signature changes.
+- [docker-compose.yaml:~29] Compose does not pass `ALLOW_QUERY_KEY` into the container. Setting it in `.env`, as instructed by `.env.example` and the README, has no effect in a Compose deployment. Suggested fix: add `ALLOW_QUERY_KEY: "${ALLOW_QUERY_KEY:-false}"`.
 
-- [public/index.html:~704] Scheduled, `pageshow`, and visibility-triggered polls can overlap. A slower older response—or error—can overwrite the result of a newer poll. Suggested fix: sequence requests and ignore all stale completions, including errors.
+- [docker-compose.yaml:~29] Compose also omits `IMAGE_EXTENSIONS`, so the server’s documented override cannot be used through the normal deployment path. Suggested fix: pass `IMAGE_EXTENSIONS: "${IMAGE_EXTENSIONS:-}"`.
 
-- [server.js:~1054] `main()` does not await the server’s `listening` event or handle its asynchronous `error` event. Bind failures such as `EADDRINUSE` bypass the structured fatal-error path, and the JSDoc promise contract is inaccurate. Suggested fix: await a Promise wired to `listening` and `error`.
+- [docker-compose.yaml:~25] `PHOTOS_DIR` is configurable, but the volume is always mounted at `/photos`. Setting `PHOTOS_DIR` to another path produces an unreadable or empty library. Suggested fix: hard-code `PHOTOS_DIR: /photos` in Compose, or mount the volume at the configured target consistently.
 
-- [verify.sh:~700] The harness assigns to `PPID`, a readonly Bash special variable. This can terminate the script before failover tests run; if execution continued, `$PPID` would identify the harness’s parent rather than the HA stub. Suggested fix: rename it to `HA_PRIMARY_PID`.
+- [public/index.html:~917] `ensurePlaylist()` does not invalidate an image already loading from the previous playlist. Its callback can display an old-album image after the selected album changes. Suggested fix: increment `app.loadToken` whenever the playlist signature changes and reset the loading state before scheduling the replacement.
 
-- [verify.sh:~700] HA stubs started through command substitution, such as `PID="$(start_stub ...)"`, run `start_stub` in a subshell. Updates to the `PIDS` cleanup array are lost, so restarted stubs can leak after the harness exits. Suggested fix: have `start_stub` set a global `LAST_PID` and invoke it without command substitution.
+- [public/index.html:~704] Timer, `pageshow`, and visibility-triggered polls can overlap. A slower older response or error can overwrite a newer result, briefly applying stale settings or incorrectly entering fallback mode. Suggested fix: assign each poll a sequence number and ignore completions older than the latest completed request.
 
-- [src/generated.py:3] The file contains unquoted Markdown rather than Python and fails to parse. Any syntax-check, import discovery, or packaging step that scans `src/` will fail. Suggested fix: delete it if it is an artifact or rename it to `reviews/generated.md`.
+- [server.js:~1210] `main()` returns before the HTTP server has actually bound its socket. `EADDRINUSE` and `EACCES` are emitted asynchronously as unhandled server errors, bypassing the structured `fatal` log path and contradicting the function’s promise documentation. Suggested fix: await `listening` and reject on `error`.
 
-- [docker-compose.yaml:9] Compose requires a file named `Dockerfile`, but no such file is present in the supplied repository. A clean `docker compose build` cannot start. Suggested fix: commit the production file under the configured name and add a clean-checkout build test.
+- [scripts/run.py:38] Failure to execute the virtual-environment interpreter raises an uncaught `OSError` and prints a traceback. Suggested fix: catch `OSError`, print a concise error to stderr, and exit nonzero.
 
-- [scripts/run.py:38] Failure to execute `VENV_PYTHON` raises an uncaught `OSError` and prints a traceback instead of the runner’s concise error format. Suggested fix: catch `OSError`, print a clear message, and exit nonzero.
+### Documentation correctness
 
-### Build and Maintainability
+- [README.md:~390] The documented `/healthz` payload and monitoring instructions no longer match the liveness-only implementation. Suggested fix: document `{"ok":true}` / `{"ok":false}` and direct authenticated HA monitoring to `/api/state`.
 
-- [package.json:1] A production dependency is declared without a supplied `package-lock.json`. Install resolution is not reproducible, and the verification script can only skip rather than perform a meaningful audit when lockfile metadata is unavailable. Suggested fix: generate and commit the lockfile.
+- [README.md:~225] The default accepted-extension list contradicts `DEFAULT_IMAGE_EXTENSIONS`. Suggested fix: list JPEG, PNG, GIF, and BMP as defaults and document `IMAGE_EXTENSIONS` separately.
 
-- [README.md:1] The README does not document required environment variables, the `?k=` authentication bootstrap, photo directory structure, health semantics, or local/deployment commands. Suggested fix: add a concise setup and operations section based on the existing Compose configuration.
+- [README.md:~330] The verification matrix substantially overstates the current `verify.sh` coverage. Suggested fix: either restore those tests or reduce the table to checks the harness currently executes.
 
 ## Test Coverage
 
-### Home Assistant State Validation
+### Home Assistant client
 
-Current unit coverage only checks the initial `HomeAssistantClient` snapshot. Add tests that stub `fetch` for:
+The smoke suite only checks the initial snapshot. The shell harness covers all-unavailable, partially usable, and fully usable polls, but these behaviors should also have direct unit tests:
 
-1. All four entities returning valid values:
-   - Values are updated.
-   - `haOk` is `true`.
-   - `haLastOk` is populated.
+1. Strict numeric rejection for `"50abc"`, `"NaN"`, `"Infinity"`, and an empty string.
+2. Primary transport failure followed by fallback success.
+3. Sticky fallback routing and periodic primary recovery through `HA_REPROBE_EVERY`.
+4. Mixed HTTP failures and valid states, verifying both applied values and `haError`.
+5. Oversized, malformed, and missing-body HA responses.
+6. Redirect responses, confirming the bearer token is not replayed.
 
-2. All entities returning `unknown` or `unavailable` with HTTP 200:
-   - Last-known-good values remain unchanged.
-   - `haOk` is `false`.
-   - `haLastOk` is not advanced.
-   - `haError` reports no usable states.
+### Browser client
 
-3. One valid entity and three invalid entities:
-   - The valid value is applied.
-   - `haOk` is `true`.
-   - Degradation details remain in `haError`.
+There is no automated client-side coverage. Add a DOM/XHR test harness for:
 
-4. Invalid numeric values such as `"50abc"`, `"NaN"`, and `"Infinity"`:
-   - Brightness and interval retain their previous valid values.
+1. Album change while an old image is loading; the old callback must not call `showLayer()`.
+2. Playlist changing to empty during an image load.
+3. Two overlapping polls where request 2 finishes before request 1:
+   - stale success is ignored;
+   - stale timeout/error is ignored.
+4. Display switching off during a load.
+5. Image timeout and consecutive-failure backoff.
+6. Schedule selection before the first entry of the day.
+7. Cache restoration with invalid, absolute, and protocol-relative paths.
+8. Rapid transitions retaining no more than two photo layers.
 
-5. Primary transport failure followed by fallback success, then periodic recovery of the primary.
-
-### Browser Client
-
-There is no automated browser-client coverage. Add a small DOM/XHR harness for:
-
-1. Album changes while an old image is loading; the old callback must never reach `showLayer()`.
-2. Two overlapping polls where request 2 resolves before request 1; request 1’s success or failure must be ignored.
-3. Display switching off during image loading; no layer is created or next photo scheduled.
-4. Schedule selection before the first daily entry; the final entry from the previous day is selected.
-5. Invalid-only albums falling back to the first album containing safe paths.
-6. Image timeout and consecutive-failure backoff.
-7. Rapid transitions retaining no more than two photo layers.
-
-### Startup and Pipeline
+### Configuration and deployment
 
 Add tests for:
 
-1. Starting the server on an occupied port:
-   - Process exits nonzero.
-   - A structured JSON `fatal` log is emitted.
+1. `IMAGE_EXTENSIONS=.html`, `.js`, and `.svg` being rejected.
+2. Valid optional formats such as `.webp` being accepted only when explicitly enabled.
+3. `docker compose config` confirming `ALLOW_QUERY_KEY` and `IMAGE_EXTENSIONS` reach the service.
+4. A non-default `PHOTOS_DIR`, or preferably a test confirming Compose fixes it to `/photos`.
+5. A clean image build and startup using minimal valid environment values.
 
-2. Missing or non-executable `VENV_PYTHON`:
-   - Runner exits nonzero.
-   - No traceback is printed.
+### HTTP startup and file serving
 
-3. Running `bash -n verify.sh` and ShellCheck:
-   - The readonly `PPID` assignment should be caught by review or a dedicated harness self-test.
+Add tests for:
 
-4. Running the complete verification harness and asserting no child HA stub remains afterward.
+1. Starting on an occupied port:
+   - process exits nonzero;
+   - a structured JSON `fatal` event is logged.
+2. A photo symlink resolving outside `PHOTOS_DIR`, tested directly against `createPhotoHandler()`.
+3. Byte-range requests, including valid, unsatisfiable, and HEAD ranges.
+4. Custom extension configuration producing the expected MIME type and serving policy.
 
-5. Running `python -m compileall scripts src`:
-   - This currently catches `src/generated.py`.
+### Pipeline runner
 
-### Packaging
-
-Add CI steps that:
-
-```sh
-test -f Dockerfile
-test -f package-lock.json
-npm ci
-npm test
-docker compose config
-docker compose build
-```
-
-Also start the image with minimal valid configuration and check `/healthz`.
-
-### Filesystem Safety
-
-Add a direct test for a photo symlink resolving outside `PHOTOS_DIR`; `createPhotoHandler()` must return 404 without serving bytes from the target.
+Add a subprocess test where `VENV_PYTHON` is absent or non-executable. Assert exit code 1, a concise error, and no traceback.
 
 ## Suggested Improvements
 
-### 1. Base HA Health on Accepted Values
+### 1. Restrict configurable image formats
 
 Before:
 
 ```js
-const usable = Object.keys(outcome.values).length > 0;
-this.#haOk = usable;
-
-if (usable) {
-  this.#lastOkAt = Date.now();
-  this.#applyValues(outcome.values);
+const ext = part.startsWith('.') ? part : `.${part}`;
+if (!EXTENSION_RE.test(ext)) {
+  throw new ConfigError(
+    `${name} entries must look like ".jpg", got ${JSON.stringify(part)}`
+  );
 }
+extensions.add(ext);
 ```
 
 After:
 
 ```js
-const accepted = this.#applyValues(outcome.values);
-const usable = accepted > 0;
-this.#haOk = usable;
+const CONFIGURABLE_IMAGE_EXTENSIONS = new Set([
+  '.jpg', '.jpeg', '.png', '.gif', '.bmp',
+  '.webp', '.heic', '.heif', '.avif', '.jxl', '.tif', '.tiff'
+]);
 
-if (usable) {
-  this.#lastOkAt = Date.now();
+const ext = part.startsWith('.') ? part : `.${part}`;
+if (!EXTENSION_RE.test(ext) || !CONFIGURABLE_IMAGE_EXTENSIONS.has(ext)) {
+  throw new ConfigError(
+    `${name} contains unsupported image extension ${JSON.stringify(part)}`
+  );
 }
+extensions.add(ext);
 ```
 
-Return the count from `#applyValues()`:
+This keeps active document formats out of the same-origin photo route.
 
-```js
-#applyValues(values) {
-  let accepted = 0;
+### 2. Make Compose match the configuration contract
 
-  const album = typeof values.album === 'string'
-    ? values.album.trim()
-    : null;
+Before:
 
-  if (
-    album !== null &&
-    !UNAVAILABLE_STATES.has(album.toLowerCase()) &&
-    isValidAlbumName(album)
-  ) {
-    this.#values.album = album;
-    accepted += 1;
-  }
+```yaml
+PHOTOS_DIR: "${PHOTOS_DIR:-/photos}"
 
-  if (typeof values.display === 'string') {
-    const display = values.display.trim().toLowerCase();
-    if (display === 'on' || display === 'off') {
-      this.#values.display = display === 'on';
-      accepted += 1;
-    }
-  }
-
-  const brightness = parseFiniteState(values.brightness);
-  if (brightness !== null) {
-    this.#values.brightness = clamp(Math.round(brightness), 10, 100);
-    accepted += 1;
-  }
-
-  const interval = parseFiniteState(values.interval);
-  if (interval !== null) {
-    this.#values.interval = clamp(Math.round(interval), 1, 3600);
-    accepted += 1;
-  }
-
-  return accepted;
-}
+AUTH_MAX_FAILS: "${AUTH_MAX_FAILS:-10}"
+AUTH_WINDOW_MS: "${AUTH_WINDOW_MS:-60000}"
 ```
 
-Update its JSDoc to `@returns {number} Number of accepted values`.
+After:
 
-### 2. Invalidate Old-Album Image Loads Immediately
+```yaml
+# The volume below is mounted at this fixed container path.
+PHOTOS_DIR: "/photos"
+
+AUTH_MAX_FAILS: "${AUTH_MAX_FAILS:-10}"
+AUTH_WINDOW_MS: "${AUTH_WINDOW_MS:-60000}"
+
+ALLOW_QUERY_KEY: "${ALLOW_QUERY_KEY:-false}"
+IMAGE_EXTENSIONS: "${IMAGE_EXTENSIONS:-}"
+```
+
+Also add both variables to `.env.example` and the README configuration table.
+
+### 3. Invalidate old playlist loads
 
 Before:
 
@@ -202,23 +168,26 @@ After:
 ```js
 if (sig === app.playlistSig) { return false; }
 
-/* Prevent an in-flight image from the old playlist being displayed. */
+/* Prevent an old playlist's in-flight image from being displayed. */
 app.loadToken++;
+app.loading = false;
 
 app.playlistSig = sig;
 app.albumName = name || null;
 ```
 
-### 3. Ignore Stale Poll Successes and Failures
+For stronger cancellation, store the active load handle in `app` and release it when the playlist changes.
 
-Add client state:
+### 4. Sequence overlapping polls
+
+Add state:
 
 ```js
 pollSequence: 0,
-handledPollSequence: 0,
+completedPollSequence: 0,
 ```
 
-Then gate every completion:
+Gate every completion:
 
 ```js
 function poll() {
@@ -230,8 +199,8 @@ function poll() {
     if (settled) { return; }
     settled = true;
 
-    if (sequence < app.handledPollSequence) { return; }
-    app.handledPollSequence = sequence;
+    if (sequence < app.completedPollSequence) { return; }
+    app.completedPollSequence = sequence;
     callback();
   }
 
@@ -241,36 +210,13 @@ function poll() {
     });
   }
 
-  /* ... */
-
-  xhr.onreadystatechange = function () {
-    if (xhr.readyState !== 4 || settled) { return; }
-
-    if (xhr.status >= 200 && xhr.status < 300) {
-      var data = null;
-      try {
-        data = JSON.parse(xhr.responseText);
-      } catch (err) {
-        data = null;
-      }
-
-      if (data && typeof data === 'object' && !isArray(data)) {
-        complete(function () {
-          onState(data);
-        });
-      } else {
-        fail('malformed JSON from bridge');
-      }
-    } else {
-      fail('HTTP ' + (xhr.status || 0));
-    }
-  };
+  /* Use complete(...) for valid responses as well. */
 }
 ```
 
-Sequencing errors as well as successes prevents an old timeout from marking the bridge unavailable after a newer successful response.
+Both successes and failures must be gated; otherwise an old timeout can mark the bridge unavailable after a newer success.
 
-### 4. Await HTTP Server Startup
+### 5. Await socket binding
 
 Before:
 
@@ -305,60 +251,13 @@ log('info', 'listening', {
   haRoutes: config.haRoutes.map((route) => route.name),
   haPollMs: config.haPollMs,
   scanMs: config.scanMs,
-  trustProxy: String(config.trustProxy)
+  trustProxy: String(config.trustProxy),
+  allowQueryKey: config.allowQueryKey,
+  imageExtensions: [...config.imageExtensions].join(',')
 });
 ```
 
-### 5. Fix Harness PID Ownership
-
-Before:
-
-```bash
-start_stub() {
-  # ...
-  node "$TMP/ha-stub.js" "$port" "$state" >"$TMP/$name.log" 2>&1 &
-  local pid=$!
-  PIDS+=("$pid")
-  printf '%s' "$pid"
-}
-
-PPID="$(start_stub ha-fo-primary "$HA_FO_PRIMARY_PORT" "$STATE_MAIN")"
-CPID="$(start_stub ha-fo-fallback "$HA_FO_FALLBACK_PORT" "$STATE_FALLBACK")"
-```
-
-After:
-
-```bash
-LAST_PID=""
-
-start_stub() {
-  local name="$1" port="$2" state="$3"
-
-  node "$TMP/ha-stub.js" "$port" "$state" >"$TMP/$name.log" 2>&1 &
-  LAST_PID=$!
-  PIDS+=("$LAST_PID")
-}
-
-start_stub ha-fo-primary "$HA_FO_PRIMARY_PORT" "$STATE_MAIN"
-HA_PRIMARY_PID="$LAST_PID"
-
-start_stub ha-fo-fallback "$HA_FO_FALLBACK_PORT" "$STATE_FALLBACK"
-HA_FALLBACK_PID="$LAST_PID"
-```
-
-Use those names throughout:
-
-```bash
-stop_pid "$HA_PRIMARY_PID"
-stop_pid "$HA_FALLBACK_PID"
-
-start_stub ha-primary-restart "$pport" "$pstate"
-HA_PRIMARY_RESTART_PID="$LAST_PID"
-```
-
-This avoids the readonly special variable and preserves cleanup-array changes in the parent shell.
-
-### 6. Handle Runner Launch Errors
+### 6. Handle runner launch failures
 
 Before:
 
@@ -385,12 +284,4 @@ except OSError as exc:
     sys.exit(1)
 
 sys.exit(result.returncode)
-```
-
-Also split the imports for readability:
-
-```python
-import os
-import subprocess
-import sys
 ```
