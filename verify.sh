@@ -137,8 +137,14 @@ jfield() { # path json
     process.stdin.on("end", () => {
       let v;
       try { v = JSON.parse(s); } catch { process.stdout.write("<invalid-json>"); return; }
+      // Own properties only. A plain a[k] walks the prototype chain, so a path
+      // like "albums.__proto__" resolves to Object.prototype ({} once
+      // stringified) for every object and an assertion that no such album is
+      // listed can never fail. Array indices stay reachable: hasOwnProperty is
+      // true for "0", "1", ... on an array.
       const out = String(process.argv[1]).split(".").reduce(
-        (a, k) => (a === null || a === undefined ? undefined : a[k]), v);
+        (a, k) => (a !== null && typeof a === "object"
+          && Object.prototype.hasOwnProperty.call(a, k) ? a[k] : undefined), v);
       if (out === undefined) { process.stdout.write("<missing>"); return; }
       process.stdout.write(typeof out === "object" ? JSON.stringify(out) : String(out));
     });
@@ -704,7 +710,7 @@ if "$NODE_BIN" -e '
     const missing = required.filter((k) => typeof m[k] !== "function");
     if (missing.length > 0) { process.stderr.write(missing.join(",")); process.exit(1); }
   }).catch((e) => { process.stderr.write(String(e)); process.exit(1); });
-' "$SERVER" 2>/dev/null; then
+' "$SERVER"; then
   ok "source: server.js imports cleanly and exports its public surface"
 else
   fail "source: server.js imports cleanly and exports its public surface"

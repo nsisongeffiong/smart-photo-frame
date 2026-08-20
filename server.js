@@ -1707,7 +1707,33 @@ async function main() {
   process.on('SIGINT', () => shutdown('SIGINT'));
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+/**
+ * True only when this file is the script node was asked to run.
+ *
+ * ESM has no `require.main`, so the usual test is argv[1] against this module's
+ * own path. That test alone is not enough: under `node -e '<script>' server.js`
+ * — how the verifier and any other importer that passes the path as an argument
+ * loads this module — argv[1] is the server path even though the entry point is
+ * the eval script. main() would then run inside the importer, and a missing
+ * HA_BASE_URL/HA_TOKEN/FRAME_KEY would exit(1) before a single export could be
+ * inspected. Node keeps -e/--eval/-p/--print in execArgv, so an eval entry is
+ * detectable; on Node 24+ `import.meta.main` would replace all of this.
+ *
+ * @returns {boolean} Whether boot side effects should run.
+ */
+function isEntryPoint() {
+  const evalEntry = process.execArgv.some((arg) => (
+    arg === '-e' || arg === '--eval' || arg === '-p' || arg === '--print'
+    || arg.startsWith('--eval=') || arg.startsWith('--print=')
+    // Short flags combine: -pe, -ep are both an eval entry.
+    || /^-[a-zA-Z]*[ep][a-zA-Z]*$/.test(arg)
+  ));
+  if (evalEntry) return false;
+  if (!process.argv[1]) return false; // node < file, or a REPL
+  return path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+}
+
+if (isEntryPoint()) {
   main().catch((error) => {
     log('error', 'fatal', { error: describeError(error) });
     process.exit(1);
