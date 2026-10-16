@@ -9,7 +9,7 @@ import { HttpError } from './errors.js';
 const sha = (s) => crypto.createHash('sha256').update(s).digest();
 
 export class Auth {
-  constructor(cfg, { now = Date.now } = {}) {
+  constructor(cfg, { now = Date.now, maxTracked = 10_000 } = {}) {
     this.cfg = cfg;
     this.now = now;
     this.cookieName = cfg.cookieSecure ? '__Host-upl' : 'upl';
@@ -18,6 +18,12 @@ export class Auth {
     this.key = cfg.sessionSecret ? sha('spf-uploader:' + cfg.sessionSecret) : crypto.randomBytes(32);
     this.passwordDigest = sha(cfg.password);
     this.fails = new Map(); // ip -> { n, resetAt }
+    // Every failure from every address counts here too. Per-address limits alone
+    // fall to anyone who can rotate addresses (IPv6 makes that cheap), so this is
+    // the real ceiling on password guesses: a few attempts' worth per window.
+    this.global = { n: 0, resetAt: 0 };
+    this.globalMaxFails = cfg.authMaxFails * 5;
+    this.maxTracked = maxTracked;
   }
 
   checkPassword(candidate) {
@@ -31,19 +37,26 @@ export class Auth {
   sweep() {
     const t = this.now();
     for (const [ip, b] of this.fails) if (b.resetAt <= t) this.fails.delete(ip);
-    // Hard cap so a spray of spoofed addresses cannot grow the map without bound.
-    if (this.fails.size > 10_000) this.fails.clear();
+    // Hard cap on memory. Every entry lives for the same window, so insertion
+    // order is expiry order: drop the entry closest to expiring, never the lot.
+    // (The global limit stops this being reachable in practice; it is a backstop.)
+    while (this.fails.size >= this.maxTracked) this.fails.delete(this.fails.keys().next().value);
   }
 
   retryAfterSeconds(ip) {
+    const t = this.now();
+    let wait = 0;
     const b = this.fails.get(ip);
-    if (!b || b.resetAt <= this.now() || b.n < this.cfg.authMaxFails) return 0;
-    return Math.max(1, Math.ceil((b.resetAt - this.now()) / 1000));
+    if (b && b.resetAt > t && b.n >= this.cfg.authMaxFails) wait = b.resetAt - t;
+    if (this.global.resetAt > t && this.global.n >= this.globalMaxFails) wait = Math.max(wait, this.global.resetAt - t);
+    return wait ? Math.max(1, Math.ceil(wait / 1000)) : 0;
   }
 
   recordFailure(ip) {
     this.sweep();
     const t = this.now();
+    if (this.global.resetAt <= t) this.global = { n: 1, resetAt: t + this.cfg.authWindowMs };
+    else this.global.n += 1;
     const b = this.fails.get(ip);
     if (!b || b.resetAt <= t) this.fails.set(ip, { n: 1, resetAt: t + this.cfg.authWindowMs });
     else b.n += 1;

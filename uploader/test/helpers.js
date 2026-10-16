@@ -12,12 +12,12 @@ export const PASSWORD = 'correct horse battery staple';
 const quiet = { debug() {}, info() {}, warn() {}, error() {} };
 
 // Start the real app on an ephemeral port with a throwaway photos directory.
-export async function startApp(env = {}, { now } = {}) {
+export async function startApp(env = {}, { now, maxTracked } = {}) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'upl-'));
   const photos = path.join(dir, 'photos');
   await fs.mkdir(photos);
   const cfg = loadConfig({ UPLOAD_PASSWORD: PASSWORD, PHOTOS_DIR: photos, MIN_FREE_MB: '0', ...env });
-  const auth = new Auth(cfg, now ? { now } : undefined);
+  const auth = new Auth(cfg, { ...(now ? { now } : {}), ...(maxTracked ? { maxTracked } : {}) });
   const library = new Library(cfg, quiet);
   const app = createApp({ cfg, log: quiet, auth, library });
   const server = await new Promise((resolve) => { const s = app.listen(0, '127.0.0.1', () => resolve(s)); });

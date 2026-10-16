@@ -72,12 +72,12 @@ rate each, then find what is missing.
 
 | # | Concern | Current state |
 |---|---|---|
-| U1 | One shared password, no accounts, no second factor. Login throttle is 10 failures per address per 15 minutes. | Accepted for a household tool; challenge it |
+| U1 | One shared password, no accounts, no second factor. Login throttle is 10 failures per address per 15 minutes, and 50 across all addresses combined (then every sign-in is refused until the window ends). | Accepted for a household tool; challenge it |
 | U2 | Sessions are a stateless HMAC cookie (`v1.<expiry>.<sig>`). A single session cannot be revoked; logout only clears the browser's copy. Rotating `SESSION_SECRET` revokes all. Without it the key is random per boot. | Accepted |
 | U3 | The throttle is in memory, per client IP from `req.ip`, so it resets on restart and depends on `TRUST_PROXY=1` matching the real proxy depth. Behind Cloudflare plus Coolify the depth would be 2. | Unverified for other topologies |
-| U4 | The whole upload is buffered in memory (up to 40 MB) before decoding. In-flight uploads are bounded to roughly 3x `PROCESS_CONCURRENCY` by a short queue. | Believed bounded; check the arithmetic against the 768 MB cap |
-| U5 | `MAX_PIXELS` defaults to 128,000,000, and the container is capped at 768 MB. One measurement so far: a flat 121 MP PNG (1.6 MB on disk) decoded and resized in under a second with peak process memory about 185 MB; a 121 MP JPEG about 140 MB. Interlaced PNG, TIFF, WebP, AVIF and several at once were **not** measured. | Partly measured; extend it, or refute |
-| U6 | A crash between writing `.upl-*.tmp` and unlinking it leaves the temp file in the album. Nothing sweeps them at boot. The frame ignores dotfiles. | Known gap |
+| U4 | The whole upload is buffered in memory (up to 40 MB) before decoding. A counter admits at most `PROCESS_CONCURRENCY + 2` uploads at once, checked before the body is read (default 3, so about 120 MB of buffers). | Believed bounded; check the arithmetic against the 768 MB cap |
+| U5 | `MAX_PIXELS` defaults to 50,000,000 and `PROCESS_CONCURRENCY` to 1; the container is capped at 768 MB. Measured peak process memory for one flat 50 MP image: interlaced PNG 270 MB, TIFF 139 MB, WebP 147 MB, **AVIF 952 MB** (about 17 MB per megapixel, decoded whole), so AVIF alone is limited to 16 MP (`HEIF_MAX_PIXELS`; 12 MP measured 294 MB, 24 MP 504 MB). Noisy, high-entropy images were not measured. | Measured for flat images; extend it, or refute |
+| U6 | A crash between writing `.upl-*.tmp` and unlinking it leaves the temp file in the album. `Library.sweepTemps()` removes them at boot; the frame ignores dotfiles. | Believed closed; check |
 | U7 | The cross-origin guard compares `Origin` to `Host` (and `X-Forwarded-Host` when `TRUST_PROXY` is set). Requests with no `Origin` header are allowed through. | Relies on SameSite=Strict as the real defence |
 | U8 | `DELETE /api/albums/:name?withPhotos=1` removes every photo and dotfile in an album in one request; confirmation exists only in the page. | Accepted |
 | U9 | The disk-space check is check-then-write and counts only the input size. | Accepted |

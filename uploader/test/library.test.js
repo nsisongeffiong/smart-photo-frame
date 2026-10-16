@@ -184,7 +184,7 @@ test('the same name uploaded again gets a numeric suffix, never an overwrite', a
 });
 
 test('parallel uploads with one name all survive', async (t) => {
-  const a = await setup(t, { PROCESS_CONCURRENCY: '4' });
+  const a = await setup(t, { PROCESS_CONCURRENCY: '6' }); // 6 + 2 uploads may be in flight
   await mkAlbum(a);
   const img = await jpeg(100, 100);
   const rs = await Promise.all(Array.from({ length: 8 }, () => a.upload('Family', img, 'same.jpg')));
@@ -383,6 +383,7 @@ test('when the line of waiting uploads is full the server says so instead of pil
   const busy = rs.filter((r) => r.status === 503 && r.data.error === 'busy').length;
   assert.equal(ok + busy, 12, rs.map((r) => r.status).join());
   assert.ok(busy >= 1, 'expected some uploads to be turned away');
+  assert.ok(ok >= 3, 'the ones that fit were still served');
   assert.equal((await fs.readdir(path.join(a.photos, 'Family'))).length, ok);
 });
 
@@ -404,4 +405,117 @@ test('a client that disconnects mid-upload leaves nothing behind and the server 
   assert.equal((await a.req('GET', '/healthz')).status, 200);
   assert.deepEqual(await fs.readdir(path.join(a.photos, 'Family')), []);
   assert.equal((await a.upload('Family', await jpeg(50, 50), 'after.jpg')).status, 201);
+});
+
+// ---------- findings from the audit ----------
+
+test('a refused album delete leaves every photo in place', async (t) => {
+  const a = await setup(t);
+  await mkAlbum(a);
+  await a.upload('Family', await jpeg(100, 100), 'a.jpg');
+  await a.upload('Family', await jpeg(100, 100), 'b.jpg');
+  await fs.writeFile(path.join(a.photos, 'Family', 'clip.MOV'), 'video');
+  const r = await a.req('DELETE', '/api/albums/Family?withPhotos=1');
+  assert.equal(r.status, 409);
+  assert.equal(r.data.error, 'has_other_files');
+  assert.deepEqual((await fs.readdir(path.join(a.photos, 'Family'))).sort(), ['a.jpg', 'b.jpg', 'clip.MOV']);
+});
+
+test('dotfiles go with a confirmed delete, photos and all', async (t) => {
+  const a = await setup(t);
+  await mkAlbum(a);
+  await a.upload('Family', await jpeg(100, 100), 'a.jpg');
+  await fs.writeFile(path.join(a.photos, 'Family', '.DS_Store'), 'x');
+  assert.equal((await a.req('DELETE', '/api/albums/Family?withPhotos=1')).status, 200);
+  assert.equal(await exists(path.join(a.photos, 'Family')), false);
+});
+
+test('names the frame would skip are refused here too (double dots)', async (t) => {
+  assert.ok(!validAlbumName('Trip..2020'));
+  assert.ok(validAlbumName('Trip.2020') && validAlbumName('a.b.c'));
+  const a = await setup(t);
+  assert.equal((await a.req('POST', '/api/albums', { json: { name: 'Trip..2020' } })).status, 400);
+  await fs.mkdir(path.join(a.photos, 'Old..Trip'));
+  const l = (await a.req('GET', '/api/albums')).data;
+  assert.deepEqual(l.albums, []);
+  assert.deepEqual(l.skipped, ['Old..Trip']);
+});
+
+test('a page full of thumbnails is served, none refused, and uploads still get through', async (t) => {
+  const a = await setup(t, { PROCESS_CONCURRENCY: '1' });
+  await mkAlbum(a);
+  const img = await jpeg(800, 600);
+  for (let i = 0; i < 30; i += 1) await fs.writeFile(path.join(a.photos, 'Family', `p${String(i).padStart(2, '0')}.jpg`), img, { mode: 0o644 });
+  const [up, ...thumbs] = await Promise.all([
+    a.upload('Family', await jpeg(100, 100), 'new.jpg'),
+    ...Array.from({ length: 30 }, (_, i) => a.req('GET', `/thumb/Family/p${String(i).padStart(2, '0')}.jpg`)),
+  ]);
+  assert.equal(up.status, 201, up.text);
+  assert.deepEqual([...new Set(thumbs.map((r) => r.status))], [200]);
+});
+
+test('a failed write leaves no temp file, and leftovers from a crash are swept at startup', async (t) => {
+  const a = await setup(t);
+  await mkAlbum(a);
+  const dir = path.join(a.photos, 'Family');
+  // Make the write fail: the temp name is taken by a directory.
+  const orig = (await import('node:fs/promises')).default.writeFile;
+  const fsp = (await import('node:fs/promises')).default;
+  fsp.writeFile = async (p, ...rest) => { if (String(p).includes('.upl-')) { await orig(p, 'partial'); throw Object.assign(new Error('disk full'), { code: 'ENOSPC' }); } return orig(p, ...rest); };
+  let r;
+  try { r = await a.upload('Family', await jpeg(100, 100), 'x.jpg'); } finally { fsp.writeFile = orig; }
+  assert.equal(r.status, 500);
+  assert.deepEqual(await leftovers(dir), [], 'the partial temp file was removed');
+
+  await fs.writeFile(path.join(dir, '.upl-0123456789abcdef.tmp'), 'junk');
+  await fs.writeFile(path.join(dir, '.upl-notours.tmp'), 'keep');          // wrong shape: not ours
+  await fs.writeFile(path.join(dir, 'keep.jpg'), await jpeg(10, 10));
+  assert.equal(await a.library.sweepTemps(), 1);
+  assert.deepEqual((await fs.readdir(dir)).sort(), ['.upl-notours.tmp', 'keep.jpg']);
+});
+
+test('uploads past the in-flight limit are refused before their bodies are read', async (t) => {
+  const net = await import('node:net');
+  const a = await setup(t, { PROCESS_CONCURRENCY: '1' }); // limit: 3 in flight
+  await mkAlbum(a);
+  const port = new URL(a.base).port;
+  const open = [];
+  const start = () => new Promise((resolve) => {
+    const sock = net.connect(port, '127.0.0.1', () => {
+      sock.write(['POST /api/albums/Family/photos HTTP/1.1', 'Host: x', `Cookie: ${a.cookie}`, 'Content-Type: multipart/form-data; boundary=zz',
+        'Content-Length: 5000000', '', '--zz', 'Content-Disposition: form-data; name="file"; filename="a.jpg"', 'Content-Type: image/jpeg', '', 'start'].join('\r\n'));
+      open.push(sock);
+      setTimeout(resolve, 80);
+    });
+  });
+  t.after(() => open.forEach((s) => s.destroy()));
+  for (let i = 0; i < 3; i += 1) await start(); // three slow uploads, bodies never finished
+  const r = await a.upload('Family', await jpeg(50, 50), 'fourth.jpg');
+  assert.equal(r.status, 503);
+  assert.equal(r.data.error, 'busy');
+  open.forEach((s) => s.destroy());
+  await new Promise((res) => setTimeout(res, 300));
+  assert.equal((await a.upload('Family', await jpeg(50, 50), 'after.jpg')).status, 201, 'slots are released when clients go away');
+});
+
+test('AVIF is decoded whole, so it has a lower size limit than other formats', async (t) => {
+  const a = await setup(t);
+  await mkAlbum(a);
+  const avif = (w, h) => sharp({ create: { width: w, height: h, channels: 3, background: '#468' } }).avif({ quality: 30, effort: 0 }).toBuffer();
+  const small = await a.upload('Family', await avif(2000, 1500), 'ok.avif');
+  assert.equal(small.status, 201, small.text);
+  assert.equal(small.data.sourceFormat, 'heif');
+  const big = await a.upload('Family', await avif(5000, 4000), 'big.avif'); // 20 MP
+  assert.equal(big.status, 413);
+  assert.equal(big.data.error, 'too_many_pixels');
+  assert.match(big.data.message, /AVIF/);
+});
+
+test('the compose file forwards every setting the README documents', async () => {
+  const compose = await fs.readFile(new URL('../docker-compose.yaml', import.meta.url), 'utf8');
+  const readme = await fs.readFile(new URL('../README.md', import.meta.url), 'utf8');
+  const documented = [...readme.matchAll(/^\| `([A-Z_]+)`(?: \/ `([A-Z_]+)`)?/gm)].flatMap((m) => [m[1], m[2]]).filter(Boolean);
+  const hostOnly = new Set(['UPLOAD_UID', 'UPLOAD_GID', 'PHOTOS_HOST_DIR', 'PORT', 'PHOTOS_DIR']);
+  const missing = documented.filter((k) => !hostOnly.has(k) && !new RegExp(`^\\s+${k}:`, 'm').test(compose));
+  assert.deepEqual(missing, []);
 });

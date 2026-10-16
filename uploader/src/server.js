@@ -31,6 +31,7 @@ try {
 const auth = new Auth(cfg);
 const library = new Library(cfg, log);
 const app = createApp({ cfg, log, auth, library });
+await library.sweepTemps().catch((e) => log.warn('temp sweep failed', { error: e.message }));
 
 const server = app.listen(cfg.port, () => {
   log.info('uploader listening', { port: cfg.port, photosDir: cfg.photosDir });

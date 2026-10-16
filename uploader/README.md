@@ -69,16 +69,16 @@ After creating an album, add the same name to the album dropdown in Home Assista
 | `UPLOAD_PASSWORD` | required | 12-128 characters, no leading/trailing space. |
 | `SESSION_SECRET` | random per start | 32+ characters; set it to survive restarts. Changing it signs everyone out. |
 | `SESSION_HOURS` | 168 | Sign-in lifetime. |
-| `TRUST_PROXY` | 1 | Proxies in front. Needed so the brute-force limit sees real client addresses. `false` if none. |
+| `TRUST_PROXY` | 1 | Proxies in front. Needed so the brute-force limit sees real client addresses. `false` if none; `2` if Cloudflare's proxy (orange cloud) is on as well as Coolify. |
 | `COOKIE_SECURE` | true | Set `false` only for plain-http local testing. |
-| `AUTH_MAX_FAILS` / `AUTH_WINDOW_MS` | 10 / 900000 | Wrong passwords allowed per address per window. |
+| `AUTH_MAX_FAILS` / `AUTH_WINDOW_MS` | 10 / 900000 | Wrong passwords allowed per address per window. Across all addresses combined the limit is 5 times this, after which every sign-in is refused until the window ends (people already signed in are unaffected). |
 | `MAX_UPLOAD_MB` | 40 | Per file. |
-| `MAX_PIXELS` | 128000000 | Refuse images that decode to more than this. |
+| `MAX_PIXELS` | 50000000 | Refuse images that decode to more than this. 50 MP covers 48 MP phone photos; raise it only if you need more, and test memory first (the container is capped at 768 MB). AVIF has its own fixed limit of 16 MP because it is decoded whole. |
 | `MAX_EDGE` | 2560 | Long-side limit. |
 | `JPEG_QUALITY` | 82 | |
 | `FRAME_MAX_PHOTOS_PER_ALBUM` | 500 | Keep equal to the frame's `MAX_PHOTOS_PER_ALBUM`. `0` disables the check. |
 | `MIN_FREE_MB` | 500 | Refuse uploads when the disk has less free than this. |
-| `PROCESS_CONCURRENCY` | 2 | Photos converted at once. |
+| `PROCESS_CONCURRENCY` | 1 | Photos converted at once. Up to this many plus 2 uploads can be in flight; any more get a "busy" reply. |
 | `PHOTOS_DIR` | /photos | Inside the container. |
 
 All settings are validated at start and every problem is reported at once.
@@ -97,7 +97,7 @@ All settings are validated at start and every problem is reported at once.
 
 ```bash
 npm install
-npm test                      # 55 tests
+npm test                      # 66 tests
 FRAME_SERVER=../server.js npm test   # also runs the real frame server against the uploader's output
 npm start                     # needs UPLOAD_PASSWORD; add COOKIE_SECURE=false for http://localhost
 ```

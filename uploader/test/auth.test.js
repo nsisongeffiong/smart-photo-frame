@@ -145,3 +145,33 @@ test('paths that try to escape the public directory are not served', async (t) =
     assert.ok([400, 404].includes(r.status), `${u} -> ${r.status}`);
   }
 });
+
+test('rotating addresses does not give unlimited guesses: all addresses share one ceiling', async (t) => {
+  let clock = 1_800_000_000_000;
+  const a = await startApp({ AUTH_MAX_FAILS: '3', AUTH_WINDOW_MS: '60000' }, { now: () => clock }); t.after(() => a.close());
+  // Ceiling is 5 x 3 = 15 wrong passwords in total, whoever they come from.
+  for (let i = 0; i < 15; i += 1) assert.equal((await a.login('nope nope nope nope', { 'x-forwarded-for': `203.0.113.${i}` })).status, 401, String(i));
+  const fresh = await a.login('nope nope nope nope', { 'x-forwarded-for': '198.51.100.99' });
+  assert.equal(fresh.status, 429);
+  assert.ok(Number(fresh.headers.get('retry-after')) > 0);
+  // The right password does not slip through while locked.
+  assert.equal((await a.login(PASSWORD, { 'x-forwarded-for': '198.51.100.98' })).status, 429);
+  clock += 61_000;
+  assert.equal((await a.login(PASSWORD, { 'x-forwarded-for': '198.51.100.97' })).status, 200);
+});
+
+test('a global lockout does not end sessions that already exist', async (t) => {
+  const a = await startApp({ AUTH_MAX_FAILS: '1' }); t.after(() => a.close());
+  await a.login(PASSWORD, { 'x-forwarded-for': '10.0.0.1' });
+  for (let i = 0; i < 5; i += 1) await a.login('nope nope nope nope', { 'x-forwarded-for': `10.0.1.${i}` });
+  assert.equal((await a.login(PASSWORD, { 'x-forwarded-for': '10.0.2.1' })).status, 429);
+  assert.equal((await a.req('GET', '/api/albums')).status, 200);
+});
+
+test('overflowing the throttle map evicts the oldest entries instead of clearing everyone', async (t) => {
+  const a = await startApp({}, { maxTracked: 20 }); t.after(() => a.close());
+  for (let i = 0; i < 30; i += 1) a.auth.recordFailure('10.0.0.' + i);
+  assert.ok(a.auth.fails.size <= 20 && a.auth.fails.size >= 19, String(a.auth.fails.size));
+  assert.ok(a.auth.fails.has('10.0.0.29'), 'the newest entry survives');
+  assert.ok(!a.auth.fails.has('10.0.0.0'), 'the oldest was evicted');
+});

@@ -21,6 +21,10 @@ const CSP = [
 
 export function createApp({ cfg, log, auth, library }) {
   const app = express();
+  // Uploads currently being received, queued or converted. Each holds its whole
+  // file in memory, so this, not the processing queue, bounds memory.
+  let uploadsInFlight = 0;
+  const maxInFlight = cfg.concurrency + 2;
   app.disable('x-powered-by');
   app.set('trust proxy', cfg.trustProxy);
   app.set('query parser', 'simple'); // plain querystring; no nested-object parsing needed here
@@ -139,40 +143,49 @@ export function createApp({ cfg, log, auth, library }) {
     if (!/^multipart\/form-data/i.test(type)) throw new HttpError(415, 'not_multipart', 'Send the photo as multipart/form-data.');
     await library.albumPath(req.params.name); // fail fast, before reading the body
 
-    const upload = await new Promise((resolve, reject) => {
-      let bb;
-      try {
-        bb = Busboy({ headers: req.headers, defParamCharset: 'utf8', limits: { files: 1, fields: 4, parts: 8, fileSize: maxBytes, fieldSize: 1024 } });
-      } catch {
-        return reject(new HttpError(400, 'bad_upload', 'The upload was not formed correctly.'));
-      }
-      const chunks = [];
-      let filename = '';
-      let got = false;
-      let tooBig = false;
-      bb.on('file', (_field, stream, info) => {
-        got = true;
-        filename = info.filename || '';
-        stream.on('data', (c) => { chunks.push(c); });
-        stream.on('limit', () => { tooBig = true; chunks.length = 0; });
+    if (uploadsInFlight >= maxInFlight) {
+      res.set('Connection', 'close'); // do not sit through a body we are about to refuse
+      throw new HttpError(503, 'busy', 'The server is busy with other photos. Try again in a moment.');
+    }
+    uploadsInFlight += 1;
+    try {
+      const upload = await new Promise((resolve, reject) => {
+        let bb;
+        try {
+          bb = Busboy({ headers: req.headers, defParamCharset: 'utf8', limits: { files: 1, fields: 4, parts: 8, fileSize: maxBytes, fieldSize: 1024 } });
+        } catch {
+          return reject(new HttpError(400, 'bad_upload', 'The upload was not formed correctly.'));
+        }
+        const chunks = [];
+        let filename = '';
+        let got = false;
+        let tooBig = false;
+        bb.on('file', (_field, stream, info) => {
+          got = true;
+          filename = info.filename || '';
+          stream.on('data', (c) => { chunks.push(c); });
+          stream.on('limit', () => { tooBig = true; chunks.length = 0; });
+        });
+        bb.on('filesLimit', () => reject(new HttpError(400, 'one_file', 'Send one photo per request.')));
+        bb.on('error', () => reject(new HttpError(400, 'bad_upload', 'The upload was not formed correctly.')));
+        bb.on('close', () => {
+          if (tooBig) return reject(new HttpError(413, 'too_large', `That file is larger than the ${cfg.maxUploadMb} MB limit.`));
+          if (!got || chunks.length === 0) return reject(new HttpError(400, 'no_file', 'No photo was received.'));
+          resolve({ buffer: Buffer.concat(chunks), filename });
+        });
+        // Client went away before the body finished: settle the promise so it cannot hang.
+        req.on('close', () => { if (!req.complete) reject(new HttpError(400, 'aborted', 'The upload was interrupted.')); });
+        req.pipe(bb);
       });
-      bb.on('filesLimit', () => reject(new HttpError(400, 'one_file', 'Send one photo per request.')));
-      bb.on('error', () => reject(new HttpError(400, 'bad_upload', 'The upload was not formed correctly.')));
-      bb.on('close', () => {
-        if (tooBig) return reject(new HttpError(413, 'too_large', `That file is larger than the ${cfg.maxUploadMb} MB limit.`));
-        if (!got || chunks.length === 0) return reject(new HttpError(400, 'no_file', 'No photo was received.'));
-        resolve({ buffer: Buffer.concat(chunks), filename });
-      });
-      // Client went away before the body finished: settle the promise so it cannot hang.
-      req.on('close', () => { if (!req.complete) reject(new HttpError(400, 'aborted', 'The upload was interrupted.')); });
-      req.pipe(bb);
-    });
 
-    const result = await library.savePhoto(req.params.name, upload.buffer, upload.filename);
-    res.status(201).json({
-      ...result,
-      onFrame: cfg.frameMaxPhotos === 0 || result.albumCount <= cfg.frameMaxPhotos,
-    });
+      const result = await library.savePhoto(req.params.name, upload.buffer, upload.filename);
+      res.status(201).json({
+        ...result,
+        onFrame: cfg.frameMaxPhotos === 0 || result.albumCount <= cfg.frameMaxPhotos,
+      });
+    } finally {
+      uploadsInFlight -= 1;
+    }
   }));
 
   app.use('/api', api);

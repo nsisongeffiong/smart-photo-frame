@@ -13,10 +13,19 @@ export const FRAME_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.bmp'
 // What sharp can decode that is worth accepting. SVG is deliberately absent.
 const INPUT_FORMATS = new Set(['jpeg', 'png', 'webp', 'gif', 'tiff', 'heif']);
 
+// AVIF is decoded whole, at roughly 17 MB per megapixel (measured: 50 MP peaked
+// at 952 MB, over the container's 768 MB cap; 12 MP at 294 MB). JPEG, PNG, WebP
+// and TIFF stream and stay near 150-270 MB at 50 MP, so only AVIF gets a lower limit.
+export const HEIF_MAX_PIXELS = 16_000_000;
+
+const heicError = () => new HttpError(415, 'unsupported_heic', 'This looks like an iPhone HEIC photo, which this server cannot decode. On the iPhone, choose "Most Compatible" under Settings > Camera > Formats, or pick the photo from the Photos picker (which converts it to JPEG).');
+
 const frameCompare = (a, b) => a.localeCompare(b, 'en', { numeric: true, sensitivity: 'base' });
 
 export function validAlbumName(name) {
-  return typeof name === 'string' && ALBUM_RE.test(name) && !RESERVED.has(name.toLowerCase()) && !name.endsWith(' ') && !name.endsWith('.');
+  return typeof name === 'string' && ALBUM_RE.test(name) && !RESERVED.has(name.toLowerCase())
+    && !name.endsWith(' ') && !name.endsWith('.')
+    && !name.includes('..'); // the frame skips any album whose name contains ".."; so must we
 }
 
 function isPhotoName(name) {
@@ -65,6 +74,10 @@ export class Library {
     this.root = cfg.photosDir;
     // Waiting uploads already hold their bytes in memory, so keep the line short.
     this.gate = new Semaphore(cfg.concurrency, cfg.concurrency * 2);
+    // Thumbnails get their own line, and they wait rather than being refused: a
+    // browser asks for a whole page of them at once (HTTP/2 has no 6-connection
+    // limit), and neither a broken tile nor a bounced upload is a good outcome.
+    this.thumbGate = new Semaphore(2, 500);
     this.thumbs = new Map();
     this.thumbBytes = 0;
     sharp.concurrency(Math.max(1, cfg.concurrency));
@@ -135,13 +148,16 @@ export class Library {
     if (entries.length && !withPhotos) {
       throw new HttpError(409, 'not_empty', `This album still has ${entries.length} file(s).`, { files: entries.length });
     }
-    for (const e of entries) {
-      if (e.name.startsWith('.') || isPhotoName(e.name)) await fs.unlink(path.join(dir, e.name));
+    // Decide everything before removing anything: a refusal must leave the album untouched.
+    const removable = (e) => e.name.startsWith('.') || isPhotoName(e.name);
+    if (!entries.every(removable)) {
+      throw new HttpError(409, 'has_other_files', 'This folder holds files that are not photos, so nothing was deleted.');
     }
+    for (const e of entries) await fs.unlink(path.join(dir, e.name));
     try {
       await fs.rmdir(dir);
     } catch (e) {
-      if (e.code === 'ENOTEMPTY') throw new HttpError(409, 'has_other_files', 'This folder holds files that are not photos, so it was left in place.');
+      if (e.code === 'ENOTEMPTY') throw new HttpError(409, 'has_other_files', 'Files appeared in this folder while it was being deleted, so it was left in place.');
       throw e;
     }
     this.log.info('album deleted', { album: name });
@@ -185,6 +201,23 @@ export class Library {
     this.log.info('photo deleted', { album, file });
   }
 
+  // Remove temp files left by a crash or a full disk. Call once at startup,
+  // when nothing can be mid-upload. Returns how many were removed.
+  async sweepTemps() {
+    let removed = 0;
+    for (const d of await fs.readdir(this.root, { withFileTypes: true })) {
+      if (!d.isDirectory() || d.isSymbolicLink() || !validAlbumName(d.name)) continue;
+      const dir = path.join(this.root, d.name);
+      for (const e of await fs.readdir(dir, { withFileTypes: true }).catch(() => [])) {
+        if (e.isFile() && /^\.upl-[0-9a-f]{16}\.tmp$/.test(e.name)) {
+          await fs.unlink(path.join(dir, e.name)).then(() => { removed += 1; }, () => {});
+        }
+      }
+    }
+    if (removed) this.log.info('removed leftover upload temp files', { count: removed });
+    return removed;
+  }
+
   async freeBytes() {
     const s = await fs.statfs(this.root);
     return Number(s.bavail) * Number(s.bsize);
@@ -205,8 +238,15 @@ export class Library {
     if (!INPUT_FORMATS.has(meta.format)) {
       throw new HttpError(415, 'unsupported_format', 'Only JPEG, PNG, WebP, GIF, TIFF and AVIF photos are accepted.');
     }
-    if (meta.format !== 'heif' && (meta.pages ?? 1) > 1) {
-      throw new HttpError(415, 'animated', 'Animated images are not supported on the frame.');
+    if (meta.format === 'heif' && meta.compression === 'hevc') throw heicError();
+    if (meta.format === 'heif' && (meta.width ?? 0) * (meta.height ?? 0) > Math.min(this.cfg.maxPixels, HEIF_MAX_PIXELS)) {
+      throw new HttpError(413, 'too_many_pixels', 'That AVIF image is larger than this server will decode (about 16 megapixels). Export it as JPEG instead.');
+    }
+    if ((meta.pages ?? 1) > 1) {
+      // A multi-image HEIC that is not AV1 is still an iPhone photo (burst, Live Photo): give the HEIC advice.
+      throw meta.format === 'heif' && meta.compression !== 'av1'
+        ? heicError()
+        : new HttpError(415, 'animated', 'Animated images are not supported on the frame.');
     }
     const asPng = Boolean(meta.hasAlpha) && meta.format !== 'jpeg';
     try {
@@ -219,9 +259,7 @@ export class Library {
       const { data, info } = await pipe.toBuffer({ resolveWithObject: true });
       return { data, info, ext: asPng ? '.png' : '.jpg', sourceFormat: meta.format };
     } catch (e) {
-      if (meta.format === 'heif') {
-        throw new HttpError(415, 'unsupported_heic', 'This looks like an iPhone HEIC photo, which this server cannot decode. On the iPhone, choose "Most Compatible" under Settings > Camera > Formats, or pick the photo from the Photos picker (which converts it to JPEG).');
-      }
+      if (meta.format === 'heif') throw heicError();
       if (/pixel limit/i.test(e.message)) throw new HttpError(413, 'too_many_pixels', 'That image is larger than this server will decode.');
       this.log.warn('image decode failed', { error: e.message });
       throw new HttpError(415, 'corrupt_image', 'That image could not be decoded. It may be damaged or cut short.');
@@ -247,9 +285,9 @@ export class Library {
     const out = await this.gate.run(() => this.convert(buffer));
     const base = sanitizeBaseName(originalName);
     const tmp = path.join(dir, `.upl-${crypto.randomBytes(8).toString('hex')}.tmp`);
-    await fs.writeFile(tmp, out.data, { flag: 'wx', mode: 0o644 });
     let final;
     try {
+      await fs.writeFile(tmp, out.data, { flag: 'wx', mode: 0o644 });
       await fs.chmod(tmp, 0o644);
       for (let i = 1; i <= 1000; i += 1) {
         final = `${base}${i === 1 ? '' : '-' + i}${out.ext}`;
@@ -292,7 +330,7 @@ export class Library {
     const key = `${p}:${stat.mtimeMs}:${stat.size}:${size}`;
     const hit = this.thumbs.get(key);
     if (hit) { this.thumbs.delete(key); this.thumbs.set(key, hit); return hit; }
-    const buf = await this.gate.run(() =>
+    const buf = await this.thumbGate.run(() =>
       sharp(p, { limitInputPixels: this.cfg.maxPixels })
         .rotate()
         .resize(size, size, { fit: 'cover' })

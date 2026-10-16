@@ -73,12 +73,12 @@ export function loadConfig(env = process.env) {
     authMaxFails: int(env, 'AUTH_MAX_FAILS', 10, 1, 1000, problems),
     authWindowMs: int(env, 'AUTH_WINDOW_MS', 900_000, 1000, 86_400_000, problems),
     maxUploadMb: int(env, 'MAX_UPLOAD_MB', 40, 1, 500, problems),
-    maxPixels: int(env, 'MAX_PIXELS', 128_000_000, 1_000_000, 1_000_000_000, problems),
+    maxPixels: int(env, 'MAX_PIXELS', 50_000_000, 1_000_000, 1_000_000_000, problems),
     maxEdge: int(env, 'MAX_EDGE', 2560, 640, 8192, problems),
     jpegQuality: int(env, 'JPEG_QUALITY', 82, 40, 100, problems),
     frameMaxPhotos: int(env, 'FRAME_MAX_PHOTOS_PER_ALBUM', 500, 0, 200_000, problems),
     minFreeMb: int(env, 'MIN_FREE_MB', 500, 0, 1_000_000, problems),
-    concurrency: int(env, 'PROCESS_CONCURRENCY', 2, 1, 8, problems),
+    concurrency: int(env, 'PROCESS_CONCURRENCY', 1, 1, 8, problems),
     logLevel: (env.LOG_LEVEL || 'info').trim(),
   };
 

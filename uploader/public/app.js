@@ -237,6 +237,11 @@
     zone.addEventListener('drop', function (e) { enqueue(name, queueEl, Array.prototype.slice.call(e.dataTransfer.files)); });
 
     var delAlbum = h('button', { class: 'danger', onclick: function () {
+      // The queue outlives this page; deleting under it would fail the photos still waiting.
+      if (busy || pending.some(function (j) { return j.album === name; })) {
+        toast('Photos are still uploading to this album. Wait for them to finish, then delete it.', 6000);
+        return;
+      }
       var q = photos.length
         ? 'Delete the album "' + name + '" and its ' + photos.length + ' photos? This cannot be undone.'
         : 'Delete the empty album "' + name + '"?';
@@ -259,6 +264,7 @@
   // ---------- routing ----------
 
   function route() {
+    onQueueIdle = null; // belongs to the album page being left
     if (!session) return;
     var m = /^#\/album\/(.+)$/.exec(location.hash);
     if (m) {
