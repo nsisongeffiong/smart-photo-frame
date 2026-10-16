@@ -1,0 +1,172 @@
+# AUDIT-BRIEF.md — uploader/
+
+Input for a review run of the pipeline: a quality reviewer, a security
+reviewer, and a synthesis stage. No implementation stage runs; the code
+already exists. Reviewers see source files plus this brief, never a task
+description. Section 2 is the threat model nobody has written yet. Attack the
+source directly; do not assume anything here is correct.
+
+**What you can and cannot see.** The pipeline sends only `.js` and
+`package.json` files. The Dockerfile and docker-compose.yaml are reproduced in
+full after this brief (in the same file) so the container hardening can be
+reviewed. The README is not sent. **Reviewers cannot run code.** Say "by
+reading" for anything you did not execute, and do not report a test as passing
+or failing unless you derived it from the source.
+
+## 1. What this is
+
+A small Node 22 / Express service that lets one household add photos to a
+digital photo frame from a phone. It is a separate service from the frame
+(`server.js` at the repository root, which is out of scope) because the frame
+mounts the photo directory read-only on purpose; this service is the only
+thing with write access.
+
+```
+phone --https--> uploader (password, read-write mount) --> /srv/photos <-- frame (read-only) <-- iPad
+```
+
+Features: password sign-in; list/create/delete albums (folders); upload one
+photo per request (multipart, buffered in memory, decoded and re-encoded with
+`sharp`/libvips: auto-orient, fit to 2560 px, JPEG q82, metadata stripped);
+list/preview/open/delete photos. It does **not** talk to Home Assistant and
+holds no Home Assistant token.
+
+The frame's contract, which this service must keep satisfying:
+
+- Album name regex `^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$`; `__proto__`,
+  `constructor`, `prototype` reserved.
+- The frame shows only .jpg .jpeg .png .gif .bmp; skips dotfiles, symlinks
+  and non-regular files; shows at most 500 photos per album (sorted by name).
+- The frame runs as a non-root user, so files must be 644 and folders 755.
+
+## 2. Threat model
+
+**Entry points:** `POST /api/login`; every `/api/*` route; `/thumb/:album/:file`;
+`/photo/:album/:file`; static files; `/healthz`. All except login, session,
+healthz and static require the session cookie.
+
+**Trust boundaries, worst first:**
+
+1. Internet -> uploader. Publicly reachable via Coolify's proxy on its own
+   hostname. Gated only by one shared password.
+2. Uploaded bytes -> libvips (via sharp). Untrusted image parsing in-process.
+3. Uploader -> filesystem. A read-write bind mount of the whole photo tree.
+4. Browser page -> API. Same-origin; cookie SameSite=Strict.
+
+**Assets, most valuable first:** integrity and availability of the family
+photographs (an attacker with the session can delete or replace all of them,
+or fill the disk) > the VPS host and anything else the container can reach
+(image-parsing code execution) > the uploader password and session secret >
+service availability. There is deliberately no Home Assistant token, no
+tailnet access and no database. Weight findings by what an attacker gains.
+
+**Compensating controls already present:** container runs as an unprivileged
+uid with a read-only root filesystem, all capabilities dropped,
+no-new-privileges, 768 MB memory cap, 200 pids, tmpfs /tmp; strict CSP (no
+inline script or style); the page builds DOM from text nodes only.
+
+## 3. Weaknesses already known
+
+Declared up front so the audit is not graded on a curve. Confirm, refute or
+rate each, then find what is missing.
+
+| # | Concern | Current state |
+|---|---|---|
+| U1 | One shared password, no accounts, no second factor. Login throttle is 10 failures per address per 15 minutes, and 50 across all addresses combined (then every sign-in is refused until the window ends). | Accepted for a household tool; challenge it |
+| U2 | Sessions are a stateless HMAC cookie (`v1.<expiry>.<sig>`). A single session cannot be revoked; logout only clears the browser's copy. Rotating `SESSION_SECRET` revokes all. Without it the key is random per boot. | Accepted |
+| U3 | The throttle is in memory, per client IP from `req.ip`, so it resets on restart and depends on `TRUST_PROXY=1` matching the real proxy depth. Behind Cloudflare plus Coolify the depth would be 2. | Unverified for other topologies |
+| U4 | The whole upload is buffered in memory (up to 40 MB) before decoding. A counter admits at most `PROCESS_CONCURRENCY + 2` uploads at once, checked before the body is read (default 3, so about 120 MB of buffers). | Believed bounded; check the arithmetic against the 768 MB cap |
+| U5 | `MAX_PIXELS` defaults to 50,000,000 and `PROCESS_CONCURRENCY` to 1; the container is capped at 768 MB. Measured peak process memory for one flat 50 MP image: interlaced PNG 270 MB, TIFF 139 MB, WebP 147 MB, **AVIF 952 MB** (about 17 MB per megapixel, decoded whole), so AVIF alone is limited to 16 MP (`HEIF_MAX_PIXELS`; 12 MP measured 294 MB, 24 MP 504 MB). Noisy, high-entropy images were not measured. | Measured for flat images; extend it, or refute |
+| U6 | A crash between writing `.upl-*.tmp` and unlinking it leaves the temp file in the album. `Library.sweepTemps()` removes them at boot; the frame ignores dotfiles. | Believed closed; check |
+| U7 | The cross-origin guard compares `Origin` to `Host` (and `X-Forwarded-Host` when `TRUST_PROXY` is set). Requests with no `Origin` header are allowed through. | Relies on SameSite=Strict as the real defence |
+| U8 | `DELETE /api/albums/:name?withPhotos=1` removes every photo and dotfile in an album in one request; confirmation exists only in the page. | Accepted |
+| U9 | The disk-space check is check-then-write and counts only the input size. | Accepted |
+| U10 | On filesystems without hard links the no-clobber save falls back to check-then-rename, which can race. | Accepted |
+| U11 | `/photo/:album/:file` serves with `sendFile`, so type comes from the extension. Files placed by other means (gif, bmp) are served as found. | Believed safe under the CSP and nosniff; check |
+
+## 4. Roles
+
+### Quality reviewer
+
+Correctness and test adequacy. Look for:
+
+- Behaviour the comments, this brief or the tests claim but the code does not
+  enforce; tests that would pass even if the code were wrong.
+- Races and ordering in `savePhoto`, album delete, the in-flight limit and the
+  client upload queue (`public/app.js`, whose queue state is module-level).
+- Mismatches with the frame's contract in section 1 (sort order, extensions,
+  permissions, the 500 cap, name rules).
+- Error paths that return the wrong status, leak, hang or crash; config
+  validation gaps; UI behaviour after sign-out, abort or navigation mid-upload.
+- The arithmetic behind U4 and U5 (memory bounds against the 768 MB cap).
+
+### Security reviewer
+
+Attack the source. Probe at minimum:
+
+- Authentication: cookie forgery and parsing (length, expiry parsing, base64url
+  handling, HMAC comparison), password comparison, throttle bypass
+  (forwarded-for forms, IPv6 spellings, `TRUST_PROXY` variants, map growth),
+  login timing.
+- Request integrity: the Origin/Host guard and its edge cases, CSRF on every
+  state-changing route, method confusion.
+- Paths: traversal and encoding tricks in every route parameter (`album`,
+  `file`), case-insensitive or Unicode-normalising filesystems, symlink and
+  hard-link races, names the frame will or will not accept, reserved names.
+- Upload handling: busboy limits and the abort paths, memory behaviour under
+  parallel and truncated uploads, decompression bombs and polyglot files,
+  `sharp` options (`failOn`, `limitInputPixels`, animated and multi-page
+  inputs), temp file lifecycle.
+- Denial of service: thumbnail cache bounds, directory listings of very large
+  albums, queue behaviour, disk fill.
+- Information leaks in errors, headers, logs and the static file server.
+- Container and compose hardening (reproduced below): uid mapping, the
+  read-write bind mount, Dockerfile choices.
+- Whether anything here can harm the frame or the photo tree in a way the
+  password does not already allow.
+
+Both reviewers: for each U-item in section 3 give a disposition (confirmed,
+refuted, or cannot tell from the source) with the file and line.
+
+### Synthesis
+
+- Start with the ledger of reviewer points you reject and why. Reconcile
+  disagreements; do not average them.
+- Emit complete corrected files, each exactly once, only for paths in the
+  writable list. Never a fragment, never an unlabelled fence.
+- Write `uploader/SECURITY.md`: what is mitigated, what is accepted with
+  reasoning, what is outstanding with a rough priority.
+- Do not write test files that rely on anything you cannot see. Tests you add
+  go under `uploader/test/` and are run by the operator afterwards.
+- End with one plainly worded paragraph: given family photographs on a public
+  VPS and a write-capable uploader behind one shared password, is this
+  acceptable to run at home? "No, restrict it to the tailnet or put it behind
+  Cloudflare Access first" is a valid and more useful answer than a hedge.
+
+## 5. Constraints
+
+- Keep every behaviour listed under "The frame's contract" in section 1.
+- Do not weaken or delete an existing test to make a change pass; extend.
+- Node 22, ESM, no build step. Do not add runtime dependencies without a
+  reason that outweighs the supply-chain cost. Keep the strict CSP.
+- Operator cost counts: this is a home server, not a SOC. A fix that needs
+  ongoing attention is worse than a slightly weaker one that does not.
+
+## 6. Scope
+
+**Writable:** `uploader/src/`, `uploader/public/`, `uploader/test/`,
+`uploader/Dockerfile`, `uploader/docker-compose.yaml`, `uploader/package.json`,
+`uploader/.env.example`, `uploader/SECURITY.md`.
+
+**Out of scope:** everything outside `uploader/`, including the frame's
+`server.js`, `public/`, `verify.sh` and scripts. Do not review the frame.
+Coolify, Traefik and TLS configuration, Cloudflare, Tailscale and Home
+Assistant are also out of scope; several findings may depend on them. Note
+those as dependencies, not as defects in this code.
+
+## 7. Acceptance (checked by the operator after the run)
+
+- `npm test` passes on the final tree, with `FRAME_SERVER` set
+- `npm audit` reports nothing high or critical
+- Every U-item has a disposition: fixed, mitigated, or accepted with reasoning
+- `uploader/SECURITY.md` is written and honest about residual risk

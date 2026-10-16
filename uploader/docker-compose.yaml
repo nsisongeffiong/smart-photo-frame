@@ -1,0 +1,58 @@
+# Photo-frame uploader: a separate service from the frame itself.
+#
+# The frame mounts /photos READ-ONLY on purpose, so a bug in the page the iPad
+# loads can never change your photos. This service is the one place that can
+# write, which is why it sits behind a password and is a second, small app.
+#
+# Coolify: create it as a second resource from the same repository with the
+# base directory set to /uploader, and give it its own domain (service port 3000).
+services:
+  photo-uploader:
+    build:
+      context: .
+    restart: unless-stopped
+
+    # Run as the user who owns the photo folder on the host, so the files written
+    # here are readable by the frame and by you over SSH. Find it with:
+    #   stat -c '%u:%g' /srv/photos
+    user: "${UPLOAD_UID:-1000}:${UPLOAD_GID:-1000}"
+
+    volumes:
+      - ${PHOTOS_HOST_DIR:-/srv/photos}:/photos      # read-write: this is the point
+
+    environment:
+      PORT: "3000"
+      PHOTOS_DIR: /photos
+      TRUST_PROXY: ${TRUST_PROXY:-1}                  # hops of proxy in front: 1 for Coolify alone, 2 if Cloudflare's proxy is on too
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}           # false only for plain-http testing on your own network
+      UPLOAD_PASSWORD: ${UPLOAD_PASSWORD:?set UPLOAD_PASSWORD to 12+ characters}
+      SESSION_SECRET: ${SESSION_SECRET:-}
+      SESSION_HOURS: ${SESSION_HOURS:-168}
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-40}
+      MAX_PIXELS: ${MAX_PIXELS:-50000000}            # decode limit; 50 MP covers 48 MP phone photos
+      PROCESS_CONCURRENCY: ${PROCESS_CONCURRENCY:-1}  # photos converted at once; 1 keeps peak memory low
+      MIN_FREE_MB: ${MIN_FREE_MB:-500}                # refuse uploads when the disk has less than this free
+      AUTH_MAX_FAILS: ${AUTH_MAX_FAILS:-10}           # wrong passwords per address per window
+      AUTH_WINDOW_MS: ${AUTH_WINDOW_MS:-900000}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      MAX_EDGE: ${MAX_EDGE:-2560}
+      JPEG_QUALITY: ${JPEG_QUALITY:-82}
+      FRAME_MAX_PHOTOS_PER_ALBUM: ${FRAME_MAX_PHOTOS_PER_ALBUM:-500}   # keep equal to the frame's MAX_PHOTOS_PER_ALBUM
+
+    # Hardening: nothing here needs to write outside /photos and /tmp.
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 768m
+    pids_limit: 200
+
+    expose:
+      - "3000"
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
