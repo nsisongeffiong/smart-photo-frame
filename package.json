@@ -6,13 +6,13 @@
   "type": "module",
   "main": "server.js",
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "scripts": {
     "start": "node server.js",
-    "test": "node --test"
+    "test": "node --test test/*.test.js"
   },
   "dependencies": {
-    "express": "4.22.2"
+    "express": "4.22.3"
   }
 }

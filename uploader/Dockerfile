@@ -1,6 +1,6 @@
 # Photo-frame uploader. Node 22 is in active LTS (Node 20 reached end of life
 # in April 2026). sharp ships prebuilt musl binaries, so no compiler is needed.
-FROM node:22-alpine
+FROM node:22.23.4-alpine
 
 ENV NODE_ENV=production
 WORKDIR /app

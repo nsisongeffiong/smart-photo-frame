@@ -8,7 +8,7 @@
 # in would make every redeploy a full re-upload and would put private images
 # into the registry.
 
-FROM node:20-alpine
+FROM node:22.23.4-alpine
 
 ENV NODE_ENV=production
 
@@ -24,7 +24,7 @@ RUN npm ci --omit=dev && npm cache clean --force
 COPY server.js ./
 COPY public ./public
 
-# node:20-alpine ships an unprivileged `node` user (uid 1000).  /photos is
+# node:22-alpine ships an unprivileged `node` user (uid 1000).  /photos is
 # created here so the mount point exists even when no volume is attached; the
 # volume is mounted read-only in normal operation.
 RUN mkdir -p /photos \
